@@ -4,7 +4,7 @@
  *  Suns Economy: Purchase, Tip, Cash Out
  * ============================================================
  *  Install dependencies:
- *    npm install express pg axios uuid dotenv express-validator
+ *    npm install express pg axios dotenv express-validator
  *
  *  Required .env variables:
  *    DATABASE_URL=postgresql://user:pass@host:5432/zuva
@@ -20,7 +20,7 @@
 const express    = require('express');
 const { Pool }   = require('pg');
 const axios      = require('axios');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('crypto');
 const { body, param, validationResult } = require('express-validator');
 require('dotenv').config();
 

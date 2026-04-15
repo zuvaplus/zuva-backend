@@ -20,9 +20,8 @@ app.use((req, res, next) => {
 
 app.use('/api', zuvaRoutes);
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', platform: 'Zuva.tv' });
-});
+app.get('/health',  (req, res) => res.json({ status: 'ok', platform: 'Zuva.tv' }));
+app.get('/healthz', (req, res) => res.json({ status: 'ok', platform: 'Zuva.tv' }));
 
 app.listen(PORT, () => {
   console.log(`Zuva backend running on http://localhost:${PORT}`);

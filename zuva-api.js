@@ -27,7 +27,10 @@ require('dotenv').config();
 const router = express.Router();
 
 // ─── Database pool ────────────────────────────────────────────
-const db = new Pool({ connectionString: process.env.DATABASE_URL });
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
 // ─── Chimoney client ──────────────────────────────────────────
 const chimoney = axios.create({

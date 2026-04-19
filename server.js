@@ -54,8 +54,17 @@ app.use((req, _res, next) => {
 });
 
 // ─── Routes ───────────────────────────────────────────────────
-app.use('/api/suns', sunsLimiter);
-app.use('/api', apiLimiter, zuvaRoutes);
+// Per-route limiters must be mounted BEFORE the global apiLimiter
+// so more-specific paths take precedence.
+const { authLimiter, contentLimiter, paymentsLimiter, tipsLimiter } =
+  require('./src/middleware/rateLimiter');
+
+app.use('/api/auth',     authLimiter);      //  20 req / 15 min
+app.use('/api/content',  contentLimiter);   //  60 req / 1 min
+app.use('/api/payments', paymentsLimiter);  //  10 req / 1 hour
+app.use('/api/tips',     tipsLimiter);      //   5 req / 1 min
+app.use('/api/suns',     sunsLimiter);      //  20 req / 15 min  (existing)
+app.use('/api',          apiLimiter, zuvaRoutes); // 100 req / 15 min (existing global)
 
 // ─── Health checks ────────────────────────────────────────────
 const healthBody = () => ({

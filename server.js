@@ -4,7 +4,14 @@ require('dotenv').config();
 const express        = require('express');
 const helmet         = require('helmet');
 const morgan         = require('morgan');
-const rateLimit      = require('express-rate-limit');
+const {
+  apiLimiter,
+  walletLimiter,
+  feedLimiter,
+  purchaseLimiter,
+  tipLimiter,
+  sunsLimiter,
+} = require('./src/middleware/rateLimiter');
 const { Pool }       = require('pg');
 const zuvaRoutes     = require('./zuva-api');
 
@@ -22,23 +29,6 @@ app.options('*', corsMiddleware);
 // ─── Request logging ──────────────────────────────────────────
 app.use(morgan('combined'));
 
-// ─── Rate limiters ────────────────────────────────────────────
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
-});
-
-const sunsLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many Sun transactions, please slow down.' },
-});
-
 // ─── Body parsing ─────────────────────────────────────────────
 app.use(express.json());
 
@@ -54,17 +44,16 @@ app.use((req, _res, next) => {
 });
 
 // ─── Routes ───────────────────────────────────────────────────
-// Per-route limiters must be mounted BEFORE the global apiLimiter
-// so more-specific paths take precedence.
-const { authLimiter, contentLimiter, paymentsLimiter, tipsLimiter } =
-  require('./src/middleware/rateLimiter');
-
-app.use('/api/auth',     authLimiter);      //  20 req / 15 min
-app.use('/api/content',  contentLimiter);   //  60 req / 1 min
-app.use('/api/payments', paymentsLimiter);  //  10 req / 1 hour
-app.use('/api/tips',     tipsLimiter);      //   5 req / 1 min
-app.use('/api/suns',     sunsLimiter);      //  20 req / 15 min  (existing)
-app.use('/api',          apiLimiter, zuvaRoutes); // 100 req / 15 min (existing global)
+// Specific-path limiters are mounted before the global catch-all
+// so a request to /api/suns/tip hits tipLimiter first, then
+// sunsLimiter, then apiLimiter — all three buckets consumed.
+app.use('/api/suns/purchase', purchaseLimiter); //  10 req / 1 hour
+app.use('/api/suns/cashout',  purchaseLimiter); //  10 req / 1 hour
+app.use('/api/suns/tip',      tipLimiter);      //   5 req / 1 min
+app.use('/api/suns',          sunsLimiter);     //  20 req / 15 min
+app.use('/api/feed',          feedLimiter);     //  60 req / 1 min
+app.use('/api/wallet',        walletLimiter);   //  20 req / 15 min
+app.use('/api',               apiLimiter, zuvaRoutes); // 100 req / 15 min (global)
 
 // ─── Health checks ────────────────────────────────────────────
 const healthBody = () => ({

@@ -1,59 +1,87 @@
 'use strict';
 
 /**
- * Per-route rate limiters.
+ * Rate limiters — all five in one place.
+ * Paths are derived from the actual routes registered in zuva-api.js:
  *
- * The global apiLimiter (100 req / 15 min) lives inline in server.js and is
- * NOT redefined here — only the four per-route limiters that are missing from
- * the current setup are exported from this file.
+ *   /api/wallet/*            → walletLimiter   (auth-gated identity)
+ *   /api/feed/*              → feedLimiter      (content / streaming)
+ *   /api/suns/purchase       → purchaseLimiter  (buy Suns)
+ *   /api/suns/cashout        → purchaseLimiter  (cash out Suns)
+ *   /api/suns/tip            → tipLimiter       (tip a creator)
+ *   /api/suns/* (catch-all)  → sunsLimiter      (ledger + anything else)
+ *   /api/*      (global)     → apiLimiter       (everything else)
  *
- * NOTE ON ROUTE PATHS
- * The existing zuva-api.js routes use /suns/tip, /suns/cashout, /suns/purchase.
- * The target config uses /api/auth, /api/content, /api/payments, /api/tips.
- * Wire these limiters to whichever route prefixes your router actually exposes.
- * The names below match the target spec; adjust mount paths in server.js as needed.
+ * Mount order in server.js matters: most-specific paths first.
  */
 
 const rateLimit = require('express-rate-limit');
 
-// ── /api/auth ─────────────────────────────────────────────────
-// 20 requests per 15 minutes — guards sign-in / token refresh endpoints.
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,   // 15 minutes
+// ── Global — all /api/* routes ────────────────────────────────
+// 100 requests per 15 minutes per IP.
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+// ── /api/wallet/* — auth-gated identity endpoints ─────────────
+// 20 requests per 15 minutes. Mirrors Clerk / JWT token-check cadence.
+const walletLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many authentication attempts, please try again later.' },
+  message: { error: 'Too many wallet requests, please try again later.' },
 });
 
-// ── /api/content ──────────────────────────────────────────────
-// 60 requests per 1 minute — allows reasonable browsing/streaming load.
-const contentLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000,    // 1 minute
+// ── /api/feed/* — content & streaming endpoints ───────────────
+// 60 requests per 1 minute. Covers recommended feed, view-complete, interests.
+const feedLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many content requests, please slow down.' },
+  message: { error: 'Too many feed requests, please slow down.' },
 });
 
-// ── /api/payments ─────────────────────────────────────────────
-// 10 requests per 1 hour — strict limit for payment initiation endpoints.
-const paymentsLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,   // 1 hour
+// ── /api/suns/purchase + /api/suns/cashout ────────────────────
+// 10 requests per 1 hour. Strict cap on payment initiation.
+const purchaseLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Payment request limit reached, please try again later.' },
 });
 
-// ── /api/tips ─────────────────────────────────────────────────
-// 5 requests per 1 minute — prevents tip-spam abuse.
-const tipsLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000,    // 1 minute
+// ── /api/suns/tip ─────────────────────────────────────────────
+// 5 requests per 1 minute. Prevents tip-spam abuse.
+const tipLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many tip requests, please wait a moment.' },
 });
 
-module.exports = { authLimiter, contentLimiter, paymentsLimiter, tipsLimiter };
+// ── /api/suns/* catch-all (ledger + anything else under suns) ─
+// 20 requests per 15 minutes.
+const sunsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many Sun transactions, please slow down.' },
+});
+
+module.exports = {
+  apiLimiter,
+  walletLimiter,
+  feedLimiter,
+  purchaseLimiter,
+  tipLimiter,
+  sunsLimiter,
+};

@@ -4,7 +4,6 @@ require('dotenv').config();
 const express        = require('express');
 const helmet         = require('helmet');
 const morgan         = require('morgan');
-const cors           = require('cors');
 const rateLimit      = require('express-rate-limit');
 const { Pool }       = require('pg');
 const zuvaRoutes     = require('./zuva-api');
@@ -15,22 +14,13 @@ const PORT = process.env.PORT || 3000;
 // ─── Security headers ─────────────────────────────────────────
 app.use(helmet());
 
+// ─── CORS ─────────────────────────────────────────────────────
+const corsMiddleware = require('./src/middleware/cors');
+app.use(corsMiddleware);
+app.options('*', corsMiddleware);
+
 // ─── Request logging ──────────────────────────────────────────
 app.use(morgan('combined'));
-
-// ─── CORS ─────────────────────────────────────────────────────
-const allowedOrigins = process.env.NODE_ENV === 'production'
-  ? ['https://zuva.tv', 'https://www.zuva.tv']
-  : ['http://localhost:3001', 'http://localhost:3000'];
-
-app.use(cors({
-  origin: (origin, cb) => {
-    // Allow server-to-server (no Origin header) and listed origins
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS: origin ${origin} not allowed`));
-  },
-  credentials: true,
-}));
 
 // ─── Rate limiters ────────────────────────────────────────────
 const apiLimiter = rateLimit({

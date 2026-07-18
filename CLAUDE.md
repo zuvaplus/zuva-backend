@@ -28,6 +28,7 @@ PLATFORM_WALLET_ID=00000000-0000-0000-0000-000000000001
 JWT_SECRET=your_jwt_secret
 NODE_ENV=production          # switches CORS to zuva.tv
 PORT=3000                    # Railway sets this automatically
+TURNSTILE_SECRET_KEY=your_turnstile_secret_key  # verifies /api/creator-signup submissions
 ```
 
 ## Architecture Notes

@@ -1319,6 +1319,83 @@ async function fetchWildcard(db, orientation, limit, usedIds) {
 
 
 // ============================================================
+//  ROUTE 11: POST /api/creator-signup
+//  Public creator application form, protected by Cloudflare Turnstile.
+//
+//  Run this SQL once against the database before using this route:
+//
+//  CREATE TABLE creator_applications (
+//    id                SERIAL PRIMARY KEY,
+//    full_name         TEXT NOT NULL,
+//    email             TEXT NOT NULL,
+//    country           TEXT NOT NULL,
+//    primary_platform  TEXT NOT NULL,
+//    social_handle     TEXT NOT NULL,
+//    content_category  TEXT NOT NULL,
+//    follower_count    TEXT NOT NULL,
+//    marketing_consent BOOLEAN NOT NULL DEFAULT FALSE,
+//    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//  );
+// ============================================================
+router.post('/creator-signup',
+  [
+    body('fullName').trim().notEmpty().withMessage('Full name is required'),
+    body('email').trim().isEmail().withMessage('A valid email is required'),
+    body('country').trim().notEmpty().withMessage('Country is required'),
+    body('primaryPlatform').trim().notEmpty().withMessage('Primary platform is required'),
+    body('socialHandle').trim().notEmpty().withMessage('Social media handle is required'),
+    body('contentCategory').trim().notEmpty().withMessage('Content category is required'),
+    body('followerCount').trim().notEmpty().withMessage('Follower count range is required'),
+    body('marketingConsent').optional().isBoolean(),
+    body('turnstileToken').notEmpty().withMessage('Turnstile verification token is required'),
+  ],
+  validate,
+  async (req, res) => {
+    const {
+      fullName, email, country, primaryPlatform, socialHandle,
+      contentCategory, followerCount, marketingConsent, turnstileToken,
+    } = req.body;
+
+    // ── Verify the Turnstile token before touching the database ────
+    try {
+      const verifyRes = await axios.post(
+        'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+        new URLSearchParams({
+          secret:   process.env.TURNSTILE_SECRET_KEY,
+          response: turnstileToken,
+          remoteip: req.ip,
+        }),
+        { timeout: 10000 }
+      );
+
+      if (!verifyRes.data?.success) {
+        return res.status(400).json({ error: 'Bot verification failed. Please try again.' });
+      }
+    } catch (err) {
+      console.error('turnstile verification error:', err.message);
+      return res.status(400).json({ error: 'Bot verification failed. Please try again.' });
+    }
+
+    try {
+      await db.query(`
+        INSERT INTO creator_applications
+          (full_name, email, country, primary_platform, social_handle, content_category, follower_count, marketing_consent, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      `, [
+        fullName, email, country, primaryPlatform, socialHandle,
+        contentCategory, followerCount, Boolean(marketingConsent),
+      ]);
+
+      res.status(201).json({ success: true });
+    } catch (err) {
+      console.error('creator signup error:', err.message);
+      res.status(500).json({ error: 'Could not submit application' });
+    }
+  }
+);
+
+
+// ============================================================
 //  EXPORT
 // ============================================================
 module.exports = router;

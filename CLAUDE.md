@@ -29,6 +29,7 @@ JWT_SECRET=your_jwt_secret
 NODE_ENV=production          # switches CORS to zuva.tv
 PORT=3000                    # Railway sets this automatically
 TURNSTILE_SECRET_KEY=your_turnstile_secret_key  # verifies /api/creator-signup submissions
+ADMIN_EMAIL=your_admin_email@zuva.tv            # gates /api/admin/* routes (see Auth note below)
 ```
 
 ## Architecture Notes
@@ -49,6 +50,12 @@ TURNSTILE_SECRET_KEY=your_turnstile_secret_key  # verifies /api/creator-signup s
 ```js
 app.use(verifyJWT);  // sets req.user from Authorization: Bearer <token>
 ```
+
+### Admin Routes (Temporary Header Check)
+`/api/admin/*` routes (`requireAdmin` in `zuva-api.js`) check an `x-admin-email` header against
+`ADMIN_EMAIL`. This is spoofable by anyone who knows the admin's email — it exists to unblock the
+admin dashboard UI before real session verification is wired up. Replace with a real Clerk session
+check (e.g. `@clerk/backend`, verifying the caller's session token server-side) before production.
 
 ### Health Checks
 Both `/health` and `/healthz` return:

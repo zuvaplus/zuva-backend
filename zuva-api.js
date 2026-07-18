@@ -21,7 +21,7 @@ const express    = require('express');
 const { Pool }   = require('pg');
 const axios      = require('axios');
 const { randomUUID: uuidv4 } = require('crypto');
-const { body, param, validationResult } = require('express-validator');
+const { body, param, query, validationResult } = require('express-validator');
 require('dotenv').config();
 
 const router = express.Router();
@@ -94,6 +94,20 @@ const requireAuth = (req, res, next) => {
 const requireCreator = (req, res, next) => {
   if (req.user?.role !== 'creator' && req.user?.role !== 'admin') {
     return res.status(403).json({ error: 'Creator account required' });
+  }
+  next();
+};
+
+// ─── Middleware: admin guard ────────────────────────────────────
+// TEMPORARY, same tradeoff as requireAuth above: this trusts a caller-
+// supplied header instead of verifying a signed session, so anyone who
+// knows ADMIN_EMAIL can spoof it. Replace with real Clerk session
+// verification (e.g. @clerk/backend, checking the verified session's
+// email) before this goes to production.
+const requireAdmin = (req, res, next) => {
+  const callerEmail = req.headers['x-admin-email'];
+  if (!process.env.ADMIN_EMAIL || callerEmail !== process.env.ADMIN_EMAIL) {
+    return res.status(403).json({ error: 'Admin access required' });
   }
   next();
 };
@@ -1357,8 +1371,16 @@ async function fetchWildcard(db, orientation, limit, usedIds) {
 //    content_category  TEXT NOT NULL,
 //    follower_count    TEXT NOT NULL,
 //    marketing_consent BOOLEAN NOT NULL DEFAULT FALSE,
+//    status             TEXT NOT NULL DEFAULT 'pending'
+//                          CHECK (status IN ('pending', 'approved', 'rejected')),
 //    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //  );
+//
+//  If the table already exists from before the admin dashboard, add the
+//  status column with:
+//    ALTER TABLE creator_applications ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+//    ALTER TABLE creator_applications ADD CONSTRAINT creator_applications_status_check
+//      CHECK (status IN ('pending', 'approved', 'rejected'));
 // ============================================================
 router.post('/creator-signup',
   [
@@ -1400,10 +1422,13 @@ router.post('/creator-signup',
     }
 
     try {
+      // Applications are auto-approved on submission (no manual review step) —
+      // the admin Applications tab still lists every application and can
+      // reject/re-approve after the fact.
       await db.query(`
         INSERT INTO creator_applications
-          (full_name, email, country, primary_platform, social_handle, content_category, follower_count, marketing_consent, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+          (full_name, email, country, primary_platform, social_handle, content_category, follower_count, marketing_consent, status, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'approved', NOW())
       `, [
         fullName, email, country, primaryPlatform, socialHandle,
         contentCategory, followerCount, Boolean(marketingConsent),
@@ -1413,6 +1438,214 @@ router.post('/creator-signup',
     } catch (err) {
       console.error('creator signup error:', err.message);
       res.status(500).json({ error: 'Could not submit application' });
+    }
+  }
+);
+
+
+// ============================================================
+//  ADMIN ROUTES
+//  All routes below require an x-admin-email header matching
+//  ADMIN_EMAIL (see the requireAdmin guard above for the caveat
+//  that this is a spoofable, temporary check).
+// ============================================================
+
+// ── GET /api/admin/applications ──────────────────────────────
+router.get('/admin/applications', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT id, full_name, email, country, primary_platform, social_handle,
+             content_category, follower_count, status, created_at
+      FROM creator_applications
+      ORDER BY created_at DESC
+    `);
+    res.json({ success: true, applications: rows });
+  } catch (err) {
+    console.error('admin applications fetch error:', err.message);
+    res.status(500).json({ error: 'Could not fetch applications' });
+  }
+});
+
+// ── PATCH /api/admin/applications/:id ────────────────────────
+router.patch('/admin/applications/:id',
+  requireAdmin,
+  [
+    param('id').isInt().withMessage('Invalid application ID'),
+    body('status').isIn(['pending', 'approved', 'rejected']).withMessage('Invalid status'),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(
+        `UPDATE creator_applications SET status = $1 WHERE id = $2 RETURNING id, status`,
+        [req.body.status, req.params.id]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'Application not found' });
+      res.json({ success: true, application: rows[0] });
+    } catch (err) {
+      console.error('admin application update error:', err.message);
+      res.status(500).json({ error: 'Could not update application' });
+    }
+  }
+);
+
+// ── GET /api/admin/content ───────────────────────────────────
+// Content lives in two tables (vertical_content / landscape_content) —
+// this unions both and tags each row with its orientation so the
+// PATCH/DELETE routes below know which table to act on.
+//
+// Run these migrations if your tables predate the admin dashboard:
+//   ALTER TABLE vertical_content  ADD COLUMN IF NOT EXISTS reports_count INTEGER NOT NULL DEFAULT 0;
+//   ALTER TABLE landscape_content ADD COLUMN IF NOT EXISTS reports_count INTEGER NOT NULL DEFAULT 0;
+// If moderation_status has a CHECK constraint, make sure 'flagged' is
+// included alongside pending/approved/rejected.
+router.get('/admin/content', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT c.id, c.orientation, c.title, c.creator_id,
+             COALESCE(u.display_name, u.username, 'Unknown') AS creator_name,
+             c.published_at, c.moderation_status AS status,
+             COALESCE(c.reports_count, 0) AS reports_count
+      FROM (
+        SELECT id, 'vertical'::text AS orientation, title, creator_id, published_at, moderation_status, reports_count
+        FROM vertical_content
+        UNION ALL
+        SELECT id, 'landscape'::text AS orientation, title, creator_id, published_at, moderation_status, reports_count
+        FROM landscape_content
+      ) c
+      LEFT JOIN users u ON u.id = c.creator_id
+      ORDER BY c.published_at DESC NULLS LAST
+    `);
+    res.json({ success: true, content: rows });
+  } catch (err) {
+    console.error('admin content fetch error:', err.message);
+    res.status(500).json({ error: 'Could not fetch content' });
+  }
+});
+
+// ── PATCH /api/admin/content/:id?orientation=vertical|landscape ──
+router.patch('/admin/content/:id',
+  requireAdmin,
+  [
+    param('id').isUUID().withMessage('Invalid content ID'),
+    query('orientation').isIn(['vertical', 'landscape']).withMessage('orientation query param is required'),
+    body('status').isIn(['pending', 'approved', 'rejected', 'flagged']).withMessage('Invalid status'),
+  ],
+  validate,
+  async (req, res) => {
+    const table = req.query.orientation === 'vertical' ? 'vertical_content' : 'landscape_content';
+    try {
+      const { rows } = await db.query(
+        `UPDATE ${table} SET moderation_status = $1 WHERE id = $2 RETURNING id, moderation_status AS status`,
+        [req.body.status, req.params.id]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'Content not found' });
+      res.json({ success: true, content: rows[0] });
+    } catch (err) {
+      console.error('admin content update error:', err.message);
+      res.status(500).json({ error: 'Could not update content' });
+    }
+  }
+);
+
+// ── DELETE /api/admin/content/:id?orientation=vertical|landscape ──
+// Soft-deletes (sets deleted_at) instead of a hard DELETE, so it doesn't
+// break FK references from tips/ledger_entries. The public feed queries
+// already filter on deleted_at IS NULL, so this hides the content
+// immediately, same as setting status to 'rejected'.
+router.delete('/admin/content/:id',
+  requireAdmin,
+  [
+    param('id').isUUID().withMessage('Invalid content ID'),
+    query('orientation').isIn(['vertical', 'landscape']).withMessage('orientation query param is required'),
+  ],
+  validate,
+  async (req, res) => {
+    const table = req.query.orientation === 'vertical' ? 'vertical_content' : 'landscape_content';
+    try {
+      const { rows } = await db.query(
+        `UPDATE ${table} SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL RETURNING id`,
+        [req.params.id]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'Content not found' });
+      res.json({ success: true });
+    } catch (err) {
+      console.error('admin content delete error:', err.message);
+      res.status(500).json({ error: 'Could not remove content' });
+    }
+  }
+);
+
+// ── GET /api/admin/users ─────────────────────────────────────
+// Assumes users has email, country_code, role, created_at columns
+// (evidenced elsewhere in this file) plus a status column for
+// suspension, which likely needs adding:
+//   ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+//   ALTER TABLE users ADD CONSTRAINT users_status_check CHECK (status IN ('active', 'suspended'));
+router.get('/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT id, display_name, email, country_code, role, status, created_at
+      FROM users
+      ORDER BY created_at DESC
+    `);
+    res.json({ success: true, users: rows });
+  } catch (err) {
+    console.error('admin users fetch error:', err.message);
+    res.status(500).json({ error: 'Could not fetch users' });
+  }
+});
+
+// ── PATCH /api/admin/users/:id ───────────────────────────────
+// Suspended users are expected to be blocked at login/upload time by
+// checking this status column — that check lives wherever auth and
+// upload requests are handled (the requireAuth shim here is a stand-in
+// until real session verification is wired up).
+router.patch('/admin/users/:id',
+  requireAdmin,
+  [
+    param('id').isUUID().withMessage('Invalid user ID'),
+    body('status').isIn(['active', 'suspended']).withMessage('Invalid status'),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(
+        `UPDATE users SET status = $1 WHERE id = $2 RETURNING id, status`,
+        [req.body.status, req.params.id]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'User not found' });
+      res.json({ success: true, user: rows[0] });
+    } catch (err) {
+      console.error('admin user update error:', err.message);
+      res.status(500).json({ error: 'Could not update user' });
+    }
+  }
+);
+
+// ── DELETE /api/admin/users/:id ──────────────────────────────
+// Permanently deletes the account, as specified. If the user has related
+// financial rows (wallets, tips, ledger entries), this fails with a
+// foreign-key violation (Postgres code 23503) rather than silently
+// cascading — surfaced as 409 so the admin can suspend instead of
+// destroying ledger history.
+router.delete('/admin/users/:id',
+  requireAdmin,
+  [param('id').isUUID().withMessage('Invalid user ID')],
+  validate,
+  async (req, res) => {
+    try {
+      const { rowCount } = await db.query('DELETE FROM users WHERE id = $1', [req.params.id]);
+      if (!rowCount) return res.status(404).json({ error: 'User not found' });
+      res.json({ success: true });
+    } catch (err) {
+      if (err.code === '23503') {
+        return res.status(409).json({
+          error: 'Cannot permanently delete a user with existing wallet or transaction history. Suspend the account instead.',
+        });
+      }
+      console.error('admin user delete error:', err.message);
+      res.status(500).json({ error: 'Could not delete user' });
     }
   }
 );

@@ -18,6 +18,11 @@ const zuvaRoutes     = require('./zuva-api');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// ─── Trust Railway's reverse proxy ─────────────────────────────
+// Required so express-rate-limit can read X-Forwarded-For correctly.
+// Without this, rate limiting throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
+
 // ─── Security headers ─────────────────────────────────────────
 app.use(helmet());
 

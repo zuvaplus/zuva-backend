@@ -27,10 +27,33 @@ require('dotenv').config();
 const router = express.Router();
 
 // ─── Database pool ────────────────────────────────────────────
+if (!process.env.DATABASE_URL) {
+  console.error('[db] DATABASE_URL is not set — the API cannot connect to Postgres.');
+}
+
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10_000, // fail fast with a clear error instead of hanging
 });
+
+db.on('error', (err) => {
+  // Fired on idle-client errors (e.g. a dropped connection) — log instead of crashing the process.
+  console.error('[db] Unexpected pool error:', err.message);
+});
+
+// Verify connectivity on boot so a bad DATABASE_URL or network issue surfaces immediately
+// in the deploy logs instead of on the first API request.
+//
+// NOTE: ENETUNREACH here almost always means Railway can't route to Supabase's direct
+// connection host (db.<project>.supabase.co), which is IPv6-only unless you've purchased
+// Supabase's IPv4 add-on. Fix: in the Supabase dashboard, use the "Connection pooler"
+// (Supavisor) connection string instead — host aws-0-<region>.pooler.supabase.com,
+// username postgres.<project-ref> — and set that as DATABASE_URL in Railway. That host
+// resolves over IPv4 and works from Railway's network.
+db.query('SELECT 1')
+  .then(() => console.log('[db] Connected to Postgres'))
+  .catch((err) => console.error('[db] Failed to connect to Postgres:', err.message));
 
 // ─── Chimoney client ──────────────────────────────────────────
 const chimoney = axios.create({

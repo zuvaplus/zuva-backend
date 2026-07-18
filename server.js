@@ -24,7 +24,6 @@ app.use(helmet());
 // ─── CORS ─────────────────────────────────────────────────────
 const corsMiddleware = require('./src/middleware/cors');
 app.use(corsMiddleware);
-app.options('(.*)', corsMiddleware);
 
 // ─── Request logging ──────────────────────────────────────────
 app.use(morgan('combined'));

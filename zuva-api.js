@@ -1184,6 +1184,114 @@ router.get('/feed/user-interests', requireAuth, async (req, res) => {
 
 
 // ============================================================
+//  ROUTE: GET /api/user/role
+//  Looks up a user's role by their Clerk user ID, sent via the
+//  x-clerk-user-id header. Used by the frontend navbar/sidebar to
+//  pick between the viewer and creator navigation experience.
+//
+//  Requires a clerk_user_id column mapping Clerk identities to
+//  internal user rows. Run this migration if it doesn't exist yet:
+//    ALTER TABLE users ADD COLUMN IF NOT EXISTS clerk_user_id TEXT UNIQUE;
+//    CREATE INDEX IF NOT EXISTS users_clerk_user_id_idx ON users(clerk_user_id);
+// ============================================================
+router.get('/user/role', async (req, res) => {
+  const clerkUserId = req.headers['x-clerk-user-id'];
+  if (!clerkUserId) return res.status(400).json({ error: 'x-clerk-user-id header is required' });
+
+  try {
+    const { rows } = await db.query(
+      'SELECT role FROM users WHERE clerk_user_id = $1',
+      [clerkUserId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true, role: rows[0].role });
+  } catch (err) {
+    console.error('user role fetch error:', err.message);
+    res.status(500).json({ error: 'Could not fetch user role' });
+  }
+});
+
+
+// ============================================================
+//  ROUTE: GET /api/search?q=<query>
+//  Searches creators (users), videos (vertical_content +
+//  landscape_content, matched on title and tags), and tags.
+//  Returns up to 10 of each, grouped as { creators, videos, tags }.
+//
+//  Assumes users has avatar_url and follower_count columns. Add
+//  if missing:
+//    ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+//    ALTER TABLE users ADD COLUMN IF NOT EXISTS follower_count INTEGER NOT NULL DEFAULT 0;
+// ============================================================
+router.get('/search',
+  [query('q').trim().notEmpty().withMessage('q query param is required')],
+  validate,
+  async (req, res) => {
+    const like = `%${req.query.q}%`;
+
+    try {
+      const [creatorsResult, videosResult, tagsResult] = await Promise.all([
+        db.query(`
+          SELECT id, username, display_name, avatar_url,
+                 COALESCE(follower_count, 0) AS follower_count
+          FROM users
+          WHERE role = 'creator'
+            AND (username ILIKE $1 OR display_name ILIKE $1)
+          ORDER BY follower_count DESC NULLS LAST
+          LIMIT 10
+        `, [like]),
+
+        db.query(`
+          SELECT c.id, c.orientation, c.title, c.thumbnail_url, c.view_count,
+                 COALESCE(u.display_name, u.username, 'Unknown') AS creator_name
+          FROM (
+            SELECT id, 'vertical'::text AS orientation, title, thumbnail_url,
+                   view_count, creator_id, ai_generated_tags
+            FROM vertical_content
+            WHERE moderation_status = 'approved' AND deleted_at IS NULL
+            UNION ALL
+            SELECT id, 'landscape'::text AS orientation, title, thumbnail_url,
+                   view_count, creator_id, ai_generated_tags
+            FROM landscape_content
+            WHERE moderation_status = 'approved' AND deleted_at IS NULL
+          ) c
+          LEFT JOIN users u ON u.id = c.creator_id
+          WHERE c.title ILIKE $1
+             OR EXISTS (SELECT 1 FROM UNNEST(c.ai_generated_tags) AS tg WHERE tg ILIKE $1)
+          ORDER BY c.view_count DESC
+          LIMIT 10
+        `, [like]),
+
+        db.query(`
+          SELECT tag, COUNT(*) AS uses FROM (
+            SELECT UNNEST(ai_generated_tags) AS tag FROM vertical_content
+            WHERE moderation_status = 'approved' AND deleted_at IS NULL
+            UNION ALL
+            SELECT UNNEST(ai_generated_tags) AS tag FROM landscape_content
+            WHERE moderation_status = 'approved' AND deleted_at IS NULL
+          ) t
+          WHERE tag ILIKE $1
+          GROUP BY tag
+          ORDER BY uses DESC
+          LIMIT 10
+        `, [like]),
+      ]);
+
+      res.json({
+        success:  true,
+        creators: creatorsResult.rows,
+        videos:   videosResult.rows,
+        tags:     tagsResult.rows.map((r) => r.tag),
+      });
+    } catch (err) {
+      console.error('search error:', err.message);
+      res.status(500).json({ error: 'Could not perform search' });
+    }
+  }
+);
+
+
+// ============================================================
 //  HELPERS  —  The three feed bucket fetchers
 //
 //  These are module-level async functions (not route handlers).

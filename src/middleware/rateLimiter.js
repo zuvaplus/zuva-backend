@@ -77,6 +77,17 @@ const sunsLimiter = rateLimit({
   message: { error: 'Too many Sun transactions, please slow down.' },
 });
 
+// ── /api/upload/* — video upload endpoints ────────────────────
+// 10 requests per 1 hour. Each upload proxies up to 2GB through this
+// server to Cloudflare Stream, so this cap is deliberately strict.
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many upload requests, please try again later.' },
+});
+
 module.exports = {
   apiLimiter,
   walletLimiter,
@@ -84,4 +95,5 @@ module.exports = {
   purchaseLimiter,
   tipLimiter,
   sunsLimiter,
+  uploadLimiter,
 };

@@ -4,7 +4,7 @@
  *  Suns Economy: Purchase, Tip, Cash Out
  * ============================================================
  *  Install dependencies:
- *    npm install express pg axios dotenv express-validator
+ *    npm install express pg axios dotenv express-validator multer form-data
  *
  *  Required .env variables:
  *    DATABASE_URL=postgresql://user:pass@host:5432/zuva
@@ -20,6 +20,11 @@
 const express    = require('express');
 const { Pool }   = require('pg');
 const axios      = require('axios');
+const multer     = require('multer');
+const FormData   = require('form-data');
+const fs         = require('fs');
+const os         = require('os');
+const path       = require('path');
 const { randomUUID: uuidv4 } = require('crypto');
 const { body, param, query, validationResult } = require('express-validator');
 require('dotenv').config();
@@ -63,6 +68,33 @@ const chimoney = axios.create({
     'Content-Type': 'application/json',
   },
   timeout: 15000,
+});
+
+// ─── Cloudflare Stream client ──────────────────────────────────
+if (!process.env.CLOUDFLARE_ACCOUNT_ID || !process.env.CLOUDFLARE_API_TOKEN) {
+  console.error('[cloudflare] CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN not set — video upload will fail.');
+}
+const cloudflareStream = axios.create({
+  baseURL: `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/stream`,
+  headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+  // Large uploads can take a while — don't let axios time the request out client-side.
+  // Railway's own proxy timeout still applies and is outside this app's control.
+  timeout: 0,
+});
+
+// ─── Video upload middleware (multer) ──────────────────────────
+// Disk storage (not memory) so a 2GB upload doesn't get buffered in RAM.
+// Files are streamed to Cloudflare Stream then deleted — see POST /upload/video.
+const videoUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, os.tmpdir()),
+    filename: (req, file, cb) => cb(null, `zuva-upload-${uuidv4()}${path.extname(file.originalname)}`),
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB, matches the frontend's stated cap
+  fileFilter: (req, file, cb) => {
+    const allowed = ['video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/avi'];
+    cb(null, allowed.includes(file.mimetype));
+  },
 });
 
 // ─── Constants ────────────────────────────────────────────────
@@ -110,6 +142,25 @@ const requireAdmin = (req, res, next) => {
     return res.status(403).json({ error: 'Admin access required' });
   }
   next();
+};
+
+// ─── Middleware: resolve the caller's DB user row from x-clerk-user-id ──
+// Same tradeoff as requireAdmin: trusts a caller-supplied header rather
+// than a verified session (matches the existing /api/user/role and
+// /api/search conventions already in this file). Attaches req.dbUser.
+const requireClerkUser = async (req, res, next) => {
+  const clerkUserId = req.headers['x-clerk-user-id'];
+  if (!clerkUserId) return res.status(400).json({ error: 'x-clerk-user-id header is required' });
+
+  try {
+    const { rows } = await db.query('SELECT * FROM users WHERE clerk_user_id = $1', [clerkUserId]);
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    req.dbUser = rows[0];
+    next();
+  } catch (err) {
+    console.error('requireClerkUser lookup error:', err.message);
+    res.status(500).json({ error: 'Could not verify user' });
+  }
 };
 
 // ─── Validation error handler ─────────────────────────────────
@@ -1200,11 +1251,14 @@ router.get('/user/role', async (req, res) => {
 
   try {
     const { rows } = await db.query(
-      'SELECT role FROM users WHERE clerk_user_id = $1',
+      'SELECT id, role, username FROM users WHERE clerk_user_id = $1',
       [clerkUserId]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
-    res.json({ success: true, role: rows[0].role });
+    // id/username are included so the frontend can source its own DB user id
+    // (e.g. as creator_id on video upload) and channel URL without guessing
+    // or trusting an unverified value.
+    res.json({ success: true, role: rows[0].role, id: rows[0].id, username: rows[0].username });
   } catch (err) {
     console.error('user role fetch error:', err.message);
     res.status(500).json({ error: 'Could not fetch user role' });
@@ -1546,6 +1600,302 @@ router.post('/creator-signup',
     } catch (err) {
       console.error('creator signup error:', err.message);
       res.status(500).json({ error: 'Could not submit application' });
+    }
+  }
+);
+
+
+// ============================================================
+//  VIDEO UPLOAD, CHANNEL, AND PLAYER ROUTES
+//
+//  Run this SQL once against the database before using these routes
+//  (requires the pgcrypto extension for gen_random_uuid — enabled by
+//  default on Supabase, otherwise: CREATE EXTENSION IF NOT EXISTS pgcrypto;):
+//
+//  CREATE TABLE videos (
+//    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+//    creator_id           UUID NOT NULL REFERENCES users(id),
+//    title                TEXT NOT NULL,
+//    description          TEXT,
+//    category             TEXT NOT NULL,
+//    tags                 TEXT[] NOT NULL DEFAULT '{}',
+//    cloudflare_video_id  TEXT NOT NULL,
+//    thumbnail_url        TEXT,
+//    duration_seconds     INTEGER,
+//    status               TEXT NOT NULL DEFAULT 'pending'
+//                           CHECK (status IN ('pending', 'published', 'rejected')),
+//    view_count           INTEGER NOT NULL DEFAULT 0,
+//    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//  );
+//
+//  CREATE TABLE video_reports (
+//    id                SERIAL PRIMARY KEY,
+//    video_id          UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+//    reason            TEXT NOT NULL,
+//    reporter_clerk_id TEXT,
+//    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//  );
+//
+//  NOTE: there is currently no admin action anywhere that moves a video from
+//  'pending' to 'published' — the admin dashboard's Content tab only covers
+//  the older vertical_content/landscape_content tables. Until it's extended
+//  to cover `videos` too (or a dedicated publish route is added), uploads
+//  will sit at 'pending' and never appear on channel pages or the player.
+// ============================================================
+
+const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'Lifestyle', 'Education', 'Other'];
+
+// ── POST /api/upload/video ───────────────────────────────────
+// Identity comes from the x-clerk-user-id header (requireClerkUser), same
+// as /api/channel/update — a client-supplied creator_id field is accepted
+// for compatibility but is checked against the authenticated user rather
+// than trusted, so a caller can't upload as someone else.
+router.post('/upload/video',
+  requireClerkUser,
+  videoUpload.single('video'),
+  [
+    body('title').trim().notEmpty().withMessage('Title is required'),
+    body('description').optional().trim(),
+    body('category').trim().isIn(VALID_VIDEO_CATEGORIES).withMessage('Invalid category'),
+    body('tags').optional().trim(),
+    body('creator_id').optional().isUUID(),
+  ],
+  validate,
+  async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'A video file is required (field name "video", mp4/mov/avi, up to 2GB)' });
+    }
+
+    if (req.body.creator_id && req.body.creator_id !== req.dbUser.id) {
+      fs.unlink(req.file.path, () => {});
+      return res.status(403).json({ error: 'creator_id must match the authenticated user' });
+    }
+    if (req.dbUser.role !== 'creator' && req.dbUser.role !== 'admin') {
+      fs.unlink(req.file.path, () => {});
+      return res.status(403).json({ error: 'Creator account required' });
+    }
+
+    const { title, description, category } = req.body;
+    const tags = (req.body.tags || '').split(',').map((t) => t.trim()).filter(Boolean);
+
+    try {
+      // ── Upload the file to Cloudflare Stream ────────────────
+      const form = new FormData();
+      form.append('file', fs.createReadStream(req.file.path), req.file.originalname);
+
+      const cfRes = await cloudflareStream.post('', form, {
+        headers: form.getHeaders(),
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      });
+
+      if (!cfRes.data?.success) {
+        console.error('cloudflare stream upload failed:', JSON.stringify(cfRes.data?.errors));
+        return res.status(502).json({ error: 'Video upload to Cloudflare Stream failed' });
+      }
+
+      const cf = cfRes.data.result;
+      const durationSeconds = cf.duration > 0 ? Math.round(cf.duration) : null;
+
+      // Note: cf.thumbnail is only reliably populated once Cloudflare finishes
+      // processing — GET /upload/status/:videoId re-syncs it once ready.
+      // Custom thumbnail uploads aren't wired up yet (no image storage is
+      // configured in this backend) — Cloudflare's auto-generated thumbnail
+      // is used regardless of what the frontend's optional thumbnail field sends.
+      const { rows } = await db.query(`
+        INSERT INTO videos
+          (creator_id, title, description, category, tags, cloudflare_video_id, thumbnail_url, duration_seconds)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING *
+      `, [
+        req.dbUser.id, title, description || null, category, tags,
+        cf.uid, cf.thumbnail || null, durationSeconds,
+      ]);
+
+      res.status(201).json({ success: true, video: rows[0] });
+    } catch (err) {
+      console.error('video upload error:', err.response?.data ?? err.message);
+      res.status(500).json({ error: 'Could not upload video' });
+    } finally {
+      fs.unlink(req.file.path, () => {}); // best-effort temp file cleanup
+    }
+  }
+);
+
+// ── GET /api/upload/status/:videoId ──────────────────────────
+// Polls Cloudflare Stream for encoding progress and syncs duration_seconds /
+// thumbnail_url once available. Does not touch the moderation `status`
+// column — see the NOTE above this section.
+router.get('/upload/status/:videoId',
+  [param('videoId').isUUID().withMessage('Invalid video ID')],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query('SELECT * FROM videos WHERE id = $1', [req.params.videoId]);
+      if (!rows.length) return res.status(404).json({ error: 'Video not found' });
+      const video = rows[0];
+
+      const cfRes = await cloudflareStream.get(`/${video.cloudflare_video_id}`);
+      const cf = cfRes.data?.result;
+      if (!cf) return res.status(502).json({ error: 'Could not reach Cloudflare Stream' });
+
+      const durationSeconds = cf.duration > 0 ? Math.round(cf.duration) : video.duration_seconds;
+      const thumbnailUrl    = cf.thumbnail || video.thumbnail_url;
+
+      if (durationSeconds !== video.duration_seconds || thumbnailUrl !== video.thumbnail_url) {
+        await db.query(
+          'UPDATE videos SET duration_seconds = $1, thumbnail_url = $2 WHERE id = $3',
+          [durationSeconds, thumbnailUrl, video.id]
+        );
+      }
+
+      res.json({
+        success: true,
+        processing_status: cf.status, // { state, pctComplete, errorReasonCode, errorReasonText }
+        video: { ...video, duration_seconds: durationSeconds, thumbnail_url: thumbnailUrl },
+      });
+    } catch (err) {
+      console.error('upload status error:', err.response?.data ?? err.message);
+      res.status(500).json({ error: 'Could not fetch upload status' });
+    }
+  }
+);
+
+// ── GET /api/channel/:username ───────────────────────────────
+router.get('/channel/:username',
+  [param('username').trim().notEmpty()],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows: creatorRows } = await db.query(`
+        SELECT id, username, display_name, bio, country_code, avatar_url,
+               COALESCE(follower_count, 0) AS follower_count, role, created_at
+        FROM users
+        WHERE username = $1
+      `, [req.params.username]);
+
+      if (!creatorRows.length) return res.status(404).json({ error: 'Creator not found' });
+      const creator = creatorRows[0];
+
+      const { rows: videos } = await db.query(`
+        SELECT id, title, thumbnail_url, duration_seconds, view_count, category, created_at
+        FROM videos
+        WHERE creator_id = $1 AND status = 'published'
+        ORDER BY created_at DESC
+      `, [creator.id]);
+
+      res.json({ success: true, creator, videos });
+    } catch (err) {
+      console.error('channel fetch error:', err.message);
+      res.status(500).json({ error: 'Could not fetch channel' });
+    }
+  }
+);
+
+// ── PATCH /api/channel/update ────────────────────────────────
+router.patch('/channel/update',
+  requireClerkUser,
+  [
+    body('display_name').optional().trim().isLength({ min: 1, max: 100 }),
+    body('bio').optional().trim().isLength({ max: 500 }),
+    body('country_code').optional().trim().isLength({ min: 2, max: 2 }),
+  ],
+  validate,
+  async (req, res) => {
+    const { display_name, bio, country_code } = req.body;
+    try {
+      const { rows } = await db.query(`
+        UPDATE users
+        SET display_name = COALESCE($1, display_name),
+            bio           = COALESCE($2, bio),
+            country_code  = COALESCE($3, country_code)
+        WHERE id = $4
+        RETURNING id, username, display_name, bio, country_code, avatar_url, role
+      `, [display_name ?? null, bio ?? null, country_code ?? null, req.dbUser.id]);
+
+      res.json({ success: true, user: rows[0] });
+    } catch (err) {
+      console.error('channel update error:', err.message);
+      res.status(500).json({ error: 'Could not update channel' });
+    }
+  }
+);
+
+// ── GET /api/video/:id ────────────────────────────────────────
+// Only serves published videos (matches the visibility convention used by
+// the existing feed queries) and increments view_count on every fetch.
+// Also returns up to 6 related videos from the same category.
+router.get('/video/:id',
+  [param('id').isUUID().withMessage('Invalid video ID')],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        WITH updated AS (
+          UPDATE videos SET view_count = view_count + 1
+          WHERE id = $1 AND status = 'published'
+          RETURNING *
+        )
+        SELECT updated.*,
+               u.id AS c_id, u.username AS c_username, u.display_name AS c_display_name,
+               u.avatar_url AS c_avatar_url, COALESCE(u.follower_count, 0) AS c_follower_count
+        FROM updated
+        LEFT JOIN users u ON u.id = updated.creator_id
+      `, [req.params.id]);
+
+      if (!rows.length) return res.status(404).json({ error: 'Video not found' });
+      const row = rows[0];
+
+      const video = {
+        id: row.id, creator_id: row.creator_id, title: row.title, description: row.description,
+        category: row.category, tags: row.tags, cloudflare_video_id: row.cloudflare_video_id,
+        thumbnail_url: row.thumbnail_url, duration_seconds: row.duration_seconds,
+        status: row.status, view_count: row.view_count, created_at: row.created_at,
+      };
+      const creator = {
+        id: row.c_id, username: row.c_username, display_name: row.c_display_name,
+        avatar_url: row.c_avatar_url, follower_count: row.c_follower_count,
+      };
+
+      const { rows: related } = await db.query(`
+        SELECT id, title, thumbnail_url, duration_seconds, view_count, created_at
+        FROM videos
+        WHERE category = $1 AND status = 'published' AND id != $2
+        ORDER BY created_at DESC
+        LIMIT 6
+      `, [video.category, video.id]);
+
+      res.json({ success: true, video, creator, related_videos: related });
+    } catch (err) {
+      console.error('video fetch error:', err.message);
+      res.status(500).json({ error: 'Could not fetch video' });
+    }
+  }
+);
+
+// ── POST /api/video/:id/report ───────────────────────────────
+const VALID_REPORT_REASONS = ['Inappropriate content', 'Copyright violation', 'Spam', 'Other'];
+
+router.post('/video/:id/report',
+  [
+    param('id').isUUID().withMessage('Invalid video ID'),
+    body('reason').isIn(VALID_REPORT_REASONS).withMessage('Invalid report reason'),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const videoCheck = await db.query('SELECT id FROM videos WHERE id = $1', [req.params.id]);
+      if (!videoCheck.rows.length) return res.status(404).json({ error: 'Video not found' });
+
+      await db.query(
+        'INSERT INTO video_reports (video_id, reason, reporter_clerk_id) VALUES ($1, $2, $3)',
+        [req.params.id, req.body.reason, req.headers['x-clerk-user-id'] || null]
+      );
+
+      res.status(201).json({ success: true });
+    } catch (err) {
+      console.error('video report error:', err.message);
+      res.status(500).json({ error: 'Could not submit report' });
     }
   }
 );

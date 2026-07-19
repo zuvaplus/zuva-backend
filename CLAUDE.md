@@ -30,6 +30,8 @@ NODE_ENV=production          # switches CORS to zuva.tv
 PORT=3000                    # Railway sets this automatically
 TURNSTILE_SECRET_KEY=your_turnstile_secret_key  # verifies /api/creator-signup submissions
 ADMIN_EMAIL=your_admin_email@zuva.tv            # gates /api/admin/* routes (see Auth note below)
+CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
+CLOUDFLARE_API_TOKEN=your_cloudflare_stream_api_token  # /api/upload/video, /api/upload/status/:id
 ```
 
 ## Architecture Notes
@@ -56,6 +58,28 @@ app.use(verifyJWT);  // sets req.user from Authorization: Bearer <token>
 `ADMIN_EMAIL`. This is spoofable by anyone who knows the admin's email — it exists to unblock the
 admin dashboard UI before real session verification is wired up. Replace with a real Clerk session
 check (e.g. `@clerk/backend`, verifying the caller's session token server-side) before production.
+
+### Identity via x-clerk-user-id (Temporary, Same Caveat)
+`/api/user/role`, `/api/channel/update`, and `/api/upload/video` resolve the caller by looking up
+`users.clerk_user_id` from an `x-clerk-user-id` header (`requireClerkUser` in `zuva-api.js`). Same
+spoofability caveat as the admin check above — replace with verified Clerk session tokens before
+production.
+
+### Video Upload (Cloudflare Stream)
+`POST /api/upload/video` proxies the uploaded file (up to 2GB) through this server to Cloudflare
+Stream via `multer` (disk storage, temp files cleaned up after) and the `form-data` package. This is
+simple but means a 2GB upload ties up a request on this server for as long as the upload takes —
+Railway's own proxy/request timeout is outside this app's control and may cut off very large or slow
+uploads. If that becomes a problem, switch to Cloudflare's "direct creator upload" flow (this server
+requests a one-time upload URL, the browser uploads straight to Cloudflare) instead of proxying bytes
+through here.
+
+Custom thumbnail uploads from the frontend aren't persisted anywhere yet — no image storage (e.g.
+Supabase Storage) is wired up in this backend, so Cloudflare's auto-generated thumbnail is always
+used regardless of what the frontend's optional thumbnail field sends.
+
+New videos always insert with `status = 'pending'` and there is currently no route that flips a video
+to `'published'` — see the NOTE above the video routes in `zuva-api.js`.
 
 ### Health Checks
 Both `/health` and `/healthz` return:

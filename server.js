@@ -11,6 +11,7 @@ const {
   purchaseLimiter,
   tipLimiter,
   sunsLimiter,
+  uploadLimiter,
 } = require('./src/middleware/rateLimiter');
 const { Pool }       = require('pg');
 const zuvaRoutes     = require('./zuva-api');
@@ -57,6 +58,7 @@ app.use('/api/suns/tip',      tipLimiter);      //   5 req / 1 min
 app.use('/api/suns',          sunsLimiter);     //  20 req / 15 min
 app.use('/api/feed',          feedLimiter);     //  60 req / 1 min
 app.use('/api/wallet',        walletLimiter);   //  20 req / 15 min
+app.use('/api/upload',        uploadLimiter);   //  10 req / 1 hour
 app.use('/api',               apiLimiter, zuvaRoutes); // 100 req / 15 min (global)
 
 // ─── Health checks ────────────────────────────────────────────

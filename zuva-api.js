@@ -222,10 +222,12 @@ const requireClerkUser = async (req, res, next) => {
 };
 
 // ─── Validation error handler ─────────────────────────────────
+// 422 Unprocessable Entity: the request was well-formed but failed field
+// validation, as distinct from a 400 (malformed request) or 404/403.
 const validate = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
+    return res.status(422).json({ errors: errors.array() });
   }
   next();
 };
@@ -1031,6 +1033,20 @@ router.get('/creator/earnings/:creatorId',
 //  DISCOVERY ENGINE  —  Routes added in v1.1
 // ============================================================
 
+// ─── SQL identifier whitelists ──────────────────────────────────
+// Postgres can't parameterize table/view names ($1 etc. only binds values),
+// so orientation is mapped through these fixed lookup tables instead of
+// being interpolated directly — a lookup can only ever produce one of
+// these exact literal strings, never arbitrary input.
+const CONTENT_TABLE_BY_ORIENTATION = {
+  vertical:  'vertical_content',
+  landscape: 'landscape_content',
+};
+const TRENDING_VIEW_BY_ORIENTATION = {
+  vertical:  'trending_vertical_24h',
+  landscape: 'trending_landscape_24h',
+};
+
 // ─── Discovery constants ──────────────────────────────────────
 // Feed composition: what percentage of each slot type
 const FEED_MIX = {
@@ -1094,7 +1110,7 @@ router.post('/feed/view-complete',
       // ── Step 1: Fetch content tags ─────────────────────────
       // We need the content's ai_generated_tags to know which
       // interests to reinforce in the user's interest graph.
-      const table  = orientation === 'vertical' ? 'vertical_content' : 'landscape_content';
+      const table  = CONTENT_TABLE_BY_ORIENTATION[orientation]; // orientation validated via isIn(['vertical','landscape']) above
       const tagRes = await client.query(
         `SELECT ai_generated_tags, creator_id FROM ${table} WHERE id = $1`,
         [contentId]
@@ -1426,7 +1442,7 @@ async function fetchTrending(db, orientation, limit) {
   const results = [];
 
   for (const o of orientations) {
-    const view   = o === 'vertical' ? 'trending_vertical_24h' : 'trending_landscape_24h';
+    const view   = TRENDING_VIEW_BY_ORIENTATION[o]; // o is always 'vertical' or 'landscape' — see orientations above
     const perO   = Math.ceil(limit / orientations.length);
 
     const { rows } = await db.query(`
@@ -1474,7 +1490,7 @@ async function fetchPersonalized(db, userId, orientation, limit, usedIds) {
   const results = [];
 
   for (const o of orientations) {
-    const table = o === 'vertical' ? 'vertical_content' : 'landscape_content';
+    const table = CONTENT_TABLE_BY_ORIENTATION[o]; // o is always 'vertical' or 'landscape' — see orientations above
     const perO  = Math.ceil(limit / orientations.length);
 
     // This query is the core of the personalisation engine.
@@ -1550,7 +1566,7 @@ async function fetchWildcard(db, orientation, limit, usedIds) {
   const results = [];
 
   for (const o of orientations) {
-    const table = o === 'vertical' ? 'vertical_content' : 'landscape_content';
+    const table = CONTENT_TABLE_BY_ORIENTATION[o]; // o is always 'vertical' or 'landscape' — see orientations above
     const perO  = Math.ceil(limit / orientations.length);
 
     const { rows } = await db.query(`
@@ -1604,14 +1620,14 @@ async function fetchWildcard(db, orientation, limit, usedIds) {
 // ============================================================
 router.post('/creator-signup',
   [
-    body('fullName').trim().notEmpty().withMessage('Full name is required'),
+    body('fullName').trim().notEmpty().isLength({ max: 100 }).withMessage('Full name is required (max 100 characters)'),
     body('email').trim().isEmail().withMessage('A valid email is required'),
     body('country').trim().notEmpty().withMessage('Country is required'),
     body('primaryPlatform').trim().notEmpty().withMessage('Primary platform is required'),
-    body('socialHandle').trim().notEmpty().withMessage('Social media handle is required'),
+    body('socialHandle').trim().notEmpty().isLength({ max: 100 }).withMessage('Social media handle is required (max 100 characters)'),
     body('contentCategory').trim().notEmpty().withMessage('Content category is required'),
     body('followerCount').trim().notEmpty().withMessage('Follower count range is required'),
-    body('marketingConsent').optional().isBoolean(),
+    body('marketingConsent').optional().isBoolean().withMessage('marketingConsent must be a boolean'),
     body('turnstileToken').notEmpty().withMessage('Turnstile verification token is required'),
   ],
   validate,
@@ -1755,11 +1771,11 @@ router.post('/upload/video',
   requireClerkUser,
   videoUpload.single('video'),
   [
-    body('title').trim().notEmpty().withMessage('Title is required'),
-    body('description').optional().trim(),
+    body('title').trim().notEmpty().isLength({ max: 200 }).withMessage('Title is required (max 200 characters)'),
+    body('description').optional().trim().isLength({ max: 2000 }).withMessage('Description must be at most 2000 characters'),
     body('category').trim().isIn(VALID_VIDEO_CATEGORIES).withMessage('Invalid category'),
-    body('tags').optional().trim(),
-    body('creator_id').optional().isUUID(),
+    body('tags').optional().isString().withMessage('tags must be a comma-separated string'),
+    body('creator_id').optional().isUUID().withMessage('Invalid creator_id'),
   ],
   validate,
   async (req, res) => {
@@ -1914,9 +1930,9 @@ router.get('/channel/:username',
 router.patch('/channel/update',
   requireClerkUser,
   [
-    body('display_name').optional().trim().isLength({ min: 1, max: 100 }),
-    body('bio').optional().trim().isLength({ max: 500 }),
-    body('country_code').optional().trim().isLength({ min: 2, max: 2 }),
+    body('display_name').optional().trim().isLength({ min: 1, max: 100 }).withMessage('display_name must be 1-100 characters'),
+    body('bio').optional().trim().isLength({ max: 500 }).withMessage('bio must be at most 500 characters'),
+    body('country_code').optional().trim().isLength({ min: 2, max: 2 }).withMessage('country_code must be a 2-letter ISO code'),
   ],
   validate,
   async (req, res) => {
@@ -2139,7 +2155,7 @@ router.patch('/admin/applications/:id',
   requireAdmin,
   [
     param('id').isInt().withMessage('Invalid application ID'),
-    body('status').isIn(['pending', 'approved', 'rejected']).withMessage('Invalid status'),
+    body('status').isIn(['approved', 'rejected']).withMessage('Invalid status'),
   ],
   validate,
   async (req, res) => {
@@ -2202,6 +2218,20 @@ router.get('/admin/content', requireAdmin, async (req, res) => {
   }
 });
 
+// Whitelist for the admin content routes below — orientation is validated
+// via isIn() first, then only ever used as a key into these fixed maps, so
+// the table/column names spliced into SQL below can never be arbitrary input.
+const ADMIN_CONTENT_TABLE_BY_ORIENTATION = {
+  vertical:  'vertical_content',
+  landscape: 'landscape_content',
+  upload:    'videos',
+};
+const ADMIN_CONTENT_STATUS_COLUMN_BY_ORIENTATION = {
+  vertical:  'moderation_status',
+  landscape: 'moderation_status',
+  upload:    'status',
+};
+
 // ── PATCH /api/admin/content/:id?orientation=vertical|landscape|upload ──
 // Status vocabulary differs by table and is passed straight through
 // without translation: vertical/landscape use pending/approved/rejected/
@@ -2217,10 +2247,8 @@ router.patch('/admin/content/:id',
   ],
   validate,
   async (req, res) => {
-    const table = req.query.orientation === 'vertical' ? 'vertical_content'
-                : req.query.orientation === 'landscape' ? 'landscape_content'
-                : 'videos';
-    const statusColumn = req.query.orientation === 'upload' ? 'status' : 'moderation_status';
+    const table = ADMIN_CONTENT_TABLE_BY_ORIENTATION[req.query.orientation];
+    const statusColumn = ADMIN_CONTENT_STATUS_COLUMN_BY_ORIENTATION[req.query.orientation];
     try {
       const { rows } = await db.query(
         `UPDATE ${table} SET ${statusColumn} = $1 WHERE id = $2 RETURNING id, ${statusColumn} AS status`,
@@ -2260,7 +2288,7 @@ router.delete('/admin/content/:id',
           [req.params.id]
         ));
       } else {
-        const table = req.query.orientation === 'vertical' ? 'vertical_content' : 'landscape_content';
+        const table = ADMIN_CONTENT_TABLE_BY_ORIENTATION[req.query.orientation];
         ({ rows } = await db.query(
           `UPDATE ${table} SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL RETURNING id`,
           [req.params.id]

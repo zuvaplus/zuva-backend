@@ -42,6 +42,17 @@ REPORT_THRESHOLD=3                              # reports before a video is auto
 
 ## Architecture Notes
 
+### Input Validation & SQL Injection
+Every POST/PATCH route validates its body/params with `express-validator`; the shared `validate`
+middleware returns **422** (not 200-range, not a generic 400) with the `errors` array on failure. All
+DB queries use `$1`/`$2`-style parameterized values — none are built by concatenating or
+template-interpolating user input into the SQL string. The only place table/column *names* are
+selected dynamically (Postgres can't parameterize identifiers) is via small whitelist lookup objects
+(`CONTENT_TABLE_BY_ORIENTATION`, `TRENDING_VIEW_BY_ORIENTATION`,
+`ADMIN_CONTENT_TABLE_BY_ORIENTATION`/`_STATUS_COLUMN_BY_ORIENTATION`) keyed off an already-validated
+value — a lookup miss just fails the query, it can never inject arbitrary SQL. No ORDER BY/LIMIT
+clause anywhere is built from user input (all are static or `$N`-parameterized).
+
 ### Database
 `pg.Pool` is configured with `ssl: { rejectUnauthorized: false }` for Supabase + Railway TLS compatibility.
 

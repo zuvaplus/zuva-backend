@@ -10,7 +10,7 @@ module.exports = function createAuthMiddleware(pool) {
    * req.user from the database. Never redirects — this is an API backend,
    * so every failure path returns JSON.
    *
-   * After this middleware, req.user = { id, role, email, countryCode, walletId }
+   * After this middleware, req.user = { id, role, email, username, countryCode, walletId }
    */
   async function requireAuth(req, res, next) {
     try {
@@ -37,7 +37,7 @@ module.exports = function createAuthMiddleware(pool) {
 
       // Look up the user in our database by their Clerk user ID
       const result = await pool.query(
-        `SELECT u.id, u.role, u.email, u.country_code AS "countryCode",
+        `SELECT u.id, u.role, u.email, u.username, u.country_code AS "countryCode",
                 w.id AS "walletId"
          FROM users u
          LEFT JOIN wallets w ON w.user_id = u.id

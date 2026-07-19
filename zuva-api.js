@@ -1296,24 +1296,11 @@ router.get('/feed/user-interests', requireAuth, async (req, res) => {
 //    ALTER TABLE users ADD COLUMN IF NOT EXISTS clerk_user_id TEXT UNIQUE;
 //    CREATE INDEX IF NOT EXISTS users_clerk_user_id_idx ON users(clerk_user_id);
 // ============================================================
-router.get('/user/role', async (req, res) => {
-  const clerkUserId = req.headers['x-clerk-user-id'];
-  if (!clerkUserId) return res.status(400).json({ error: 'x-clerk-user-id header is required' });
-
-  try {
-    const { rows } = await db.query(
-      'SELECT id, role, username FROM users WHERE clerk_user_id = $1',
-      [clerkUserId]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'User not found' });
-    // id/username are included so the frontend can source its own DB user id
-    // (e.g. as creator_id on video upload) and channel URL without guessing
-    // or trusting an unverified value.
-    res.json({ success: true, role: rows[0].role, id: rows[0].id, username: rows[0].username });
-  } catch (err) {
-    console.error('user role fetch error:', err.message);
-    res.status(500).json({ error: 'Could not fetch user role' });
-  }
+router.get('/user/role', requireAuth, async (req, res) => {
+  // id/username are included so the frontend can source its own DB user id
+  // (e.g. as creator_id on video upload) and channel URL without guessing
+  // or trusting an unverified value.
+  res.json({ success: true, role: req.user.role, id: req.user.id, username: req.user.username });
 });
 
 

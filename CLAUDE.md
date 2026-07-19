@@ -35,6 +35,9 @@ CLOUDFLARE_API_TOKEN=your_cloudflare_stream_api_token  # /api/upload/video, /api
 AWS_ACCESS_KEY_ID=your_aws_access_key_id        # Rekognition content moderation (see below)
 AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
 AWS_REGION=us-east-1
+GMAIL_USER=your_gmail_address@gmail.com         # admin moderation email alerts (see below)
+GMAIL_APP_PASSWORD=your_16_char_app_password    # Google Account → Security → App passwords
+REPORT_THRESHOLD=3                              # reports before a video is auto-hidden for AI re-review
 ```
 
 ## Architecture Notes
@@ -98,11 +101,33 @@ the synchronous *image* API (`DetectModerationLabels`) against the video's Cloud
 - Any failure (thumbnail not ready yet, AWS error, network issue) → caught, video stays `'pending'`,
   request does not crash
 
-`'flagged'` is a valid `videos.status` value but is **not** produced by `moderateVideo()` itself — it's
-reserved for other paths (e.g. a future reports-triggered review flow). `GET /api/admin/moderation-queue`
-surfaces both `'flagged'` and `'rejected'` videos for admin review. The admin dashboard's Content tab
-(`GET/PATCH/DELETE /api/admin/content`) now also covers `videos` (`?orientation=upload`), not just the
-older `vertical_content`/`landscape_content` tables.
+`'flagged'` is a valid `videos.status` value but is **not** produced by any automated path — reserved
+for future use (e.g. manual admin flagging). The admin dashboard's Content tab
+(`GET/PATCH/DELETE /api/admin/content`) covers `videos` (`?orientation=upload`) as well as the older
+`vertical_content`/`landscape_content` tables.
+
+### Report-Triggered AI Re-Review
+`POST /api/video/:id/report` counts total reports for the video after inserting the new one. Once the
+count reaches `REPORT_THRESHOLD` (default 3), the video is immediately set to `status = 'under_review'`
+(hidden — same visibility gate as everywhere else: `status = 'published'` required to show) and
+`moderateReportedVideo(videoId, cloudflareVideoId)` is fired without being awaited, so the reporting
+user's request doesn't wait on it. That function re-runs the same thumbnail-based Rekognition check as
+`moderateVideo()`:
+- Labels found → `status = 'rejected'` (stays hidden), admin emailed **"Video Rejected by AI"**
+- Clean → `status = 'published'` (goes live again), admin emailed **"Reported Video Cleared by AI"**
+- Rekognition/thumbnail fetch throws → status left at `'under_review'`, admin emailed
+  **"Video Needs Manual Review"**
+
+`GET /api/admin/moderation-queue` returns videos with `status IN ('under_review', 'flagged')`, ordered
+by report count descending — `'rejected'` is intentionally excluded since it's already a terminal,
+hidden state needing no further action.
+
+### Admin Email Alerts (Gmail SMTP via nodemailer)
+`sendAdminEmail(subject, htmlBody)` in `zuva-api.js` sends to `ADMIN_EMAIL` via Gmail SMTP
+(`GMAIL_USER` / `GMAIL_APP_PASSWORD` — the password must be a Google **App Password**, not the account
+login password). Never throws: if mail isn't configured or sending fails, it logs and returns, so a
+broken mail setup can't break the moderation flow that triggered it (the DB status change already
+happened by the time the email is attempted).
 
 ### Health Checks
 Both `/health` and `/healthz` return:

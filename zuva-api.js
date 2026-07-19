@@ -28,6 +28,7 @@ const path       = require('path');
 const { randomUUID: uuidv4 } = require('crypto');
 const { body, param, query, validationResult } = require('express-validator');
 const { RekognitionClient, DetectModerationLabelsCommand } = require('@aws-sdk/client-rekognition');
+const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const router = express.Router();
@@ -94,6 +95,50 @@ const rekognition = new RekognitionClient({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
+
+// ─── Mail (Gmail SMTP via nodemailer) — admin moderation alerts ─
+let mailTransport = null;
+if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+  mailTransport = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: process.env.GMAIL_APP_PASSWORD,
+    },
+  });
+} else {
+  console.error('[mail] GMAIL_USER / GMAIL_APP_PASSWORD not set — admin moderation emails will not be sent.');
+}
+
+// Never throws — a failed/unconfigured email should not break whatever
+// moderation action triggered it (the DB status change already happened).
+async function sendAdminEmail(subject, htmlBody) {
+  if (!mailTransport || !process.env.ADMIN_EMAIL) {
+    console.error(`[mail] Skipping email "${subject}" — mail transport or ADMIN_EMAIL not configured.`);
+    return;
+  }
+  try {
+    await mailTransport.sendMail({
+      from: process.env.GMAIL_USER,
+      to: process.env.ADMIN_EMAIL,
+      subject,
+      html: htmlBody,
+    });
+  } catch (err) {
+    console.error(`[mail] Failed to send admin email "${subject}":`, err.message);
+  }
+}
+
+// Minimal HTML escaping for user-supplied strings (video title, creator
+// name) interpolated into email bodies below.
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // ─── Video upload middleware (multer) ──────────────────────────
 // Disk storage (not memory) so a 2GB upload doesn't get buffered in RAM.
@@ -1636,12 +1681,13 @@ router.post('/creator-signup',
 //    thumbnail_url        TEXT,
 //    duration_seconds     INTEGER,
 //    status               TEXT NOT NULL DEFAULT 'pending'
-//                           CHECK (status IN ('pending', 'published', 'rejected', 'flagged')),
+//                           CHECK (status IN ('pending', 'published', 'rejected', 'flagged', 'under_review')),
 //    view_count           INTEGER NOT NULL DEFAULT 0,
 //    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //  );
-//  -- If this table predates AWS Rekognition moderation, add 'flagged' to
-//  -- the existing status CHECK constraint (see moderateVideo() below).
+//  -- If this table predates AWS Rekognition moderation / report-triggered
+//  -- review, add 'flagged' and 'under_review' to the existing status
+//  -- CHECK constraint (see moderateVideo() / moderateReportedVideo() below).
 //
 //  CREATE TABLE video_reports (
 //    id                SERIAL PRIMARY KEY,
@@ -1651,10 +1697,14 @@ router.post('/creator-signup',
 //    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //  );
 //
-//  NOTE: moderateVideo() (below) only ever sets 'published' or 'rejected'
-//  automatically — 'flagged' is not produced by the upload pipeline itself,
-//  it's reserved for other paths (e.g. a future user-reports-triggered
-//  review, or manual admin flagging). See GET /admin/moderation-queue.
+//  NOTE: moderateVideo() (upload-time) only ever sets 'published' or
+//  'rejected' automatically. moderateReportedVideo() (report-triggered,
+//  see POST /video/:id/report) sets 'under_review' when the report count
+//  crosses REPORT_THRESHOLD, then 'published' or 'rejected' once AI
+//  re-review completes — or leaves it at 'under_review' if that re-review
+//  itself fails, for manual follow-up. 'flagged' is still not produced by
+//  any automated path — reserved for future use (e.g. manual admin
+//  flagging). See GET /admin/moderation-queue.
 // ============================================================
 
 const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'Lifestyle', 'Education', 'Other'];
@@ -1769,10 +1819,18 @@ router.post('/upload/video',
       // status immediately rather than a stale 'pending'. moderateVideo()
       // never throws — on failure the video simply stays 'pending'.
       const moderation = await moderateVideo(cf.uid);
-      if (moderation.safe === true) video = { ...video, status: 'published' };
-      else if (moderation.safe === false) video = { ...video, status: 'rejected' };
+      let message;
+      if (moderation.safe === true) {
+        video = { ...video, status: 'published' };
+        message = 'Video uploaded successfully and is now live.';
+      } else if (moderation.safe === false) {
+        video = { ...video, status: 'rejected' };
+        message = 'Video uploaded but did not pass content moderation and has been rejected.';
+      } else {
+        message = 'Video uploaded successfully and is pending review.';
+      }
 
-      res.status(201).json({ success: true, video, moderation });
+      res.status(201).json({ success: true, video, moderation, message });
     } catch (err) {
       console.error('video upload error:', err.response?.data ?? err.message);
       res.status(500).json({ error: 'Could not upload video' });
@@ -1933,6 +1991,79 @@ router.get('/video/:id',
   }
 );
 
+// ── Report-triggered AI re-review ─────────────────────────────
+// Number of reports a video needs before it's auto-hidden ('under_review')
+// and sent back through AWS Rekognition. Read once at startup — restart
+// the process to pick up a changed REPORT_THRESHOLD.
+const REPORT_THRESHOLD = parseInt(process.env.REPORT_THRESHOLD, 10) || 3;
+
+// Re-runs the same thumbnail-based Rekognition check as moderateVideo()
+// (see the NOTE there on why this only checks the thumbnail, not the full
+// video), but for an already-published video that just crossed the report
+// threshold. Always emails the admin with the outcome. Never throws —
+// covers its own DB/Rekognition/email failures so the caller (the report
+// route, which does not await this) can't be broken by it.
+async function moderateReportedVideo(videoId, cloudflareVideoId) {
+  let videoInfo;
+  try {
+    const { rows } = await db.query(`
+      SELECT v.title,
+             COALESCE(u.display_name, u.username, 'Unknown') AS creator_name,
+             (SELECT COUNT(*)::int FROM video_reports vr WHERE vr.video_id = v.id) AS report_count
+      FROM videos v
+      LEFT JOIN users u ON u.id = v.creator_id
+      WHERE v.id = $1
+    `, [videoId]);
+    videoInfo = rows[0];
+  } catch (err) {
+    console.error('moderateReportedVideo: could not load video context:', err.message);
+    return;
+  }
+  if (!videoInfo) return;
+
+  const details = `
+    <ul>
+      <li><strong>Title:</strong> ${escapeHtml(videoInfo.title)}</li>
+      <li><strong>Creator:</strong> ${escapeHtml(videoInfo.creator_name)}</li>
+      <li><strong>Report count:</strong> ${videoInfo.report_count}</li>
+  `;
+
+  try {
+    const thumbnailUrl = `https://videodelivery.net/${cloudflareVideoId}/thumbnails/thumbnail.jpg`;
+    const imageRes = await axios.get(thumbnailUrl, { responseType: 'arraybuffer', timeout: 15000 });
+    const imageBytes = Buffer.from(imageRes.data);
+
+    const result = await rekognition.send(new DetectModerationLabelsCommand({
+      Image: { Bytes: imageBytes },
+      MinConfidence: 75,
+    }));
+    const labels = result.ModerationLabels || [];
+
+    if (labels.length > 0) {
+      await db.query(`UPDATE videos SET status = 'rejected' WHERE id = $1`, [videoId]);
+      const labelList = labels.map((l) => `${escapeHtml(l.Name)} (${l.Confidence.toFixed(1)}%)`).join(', ');
+      await sendAdminEmail(
+        'Video Rejected by AI',
+        `<p>A reported video was automatically rejected after AI re-review and remains hidden.</p>${details}
+         <li><strong>Labels found:</strong> ${labelList}</li></ul>`
+      );
+    } else {
+      await db.query(`UPDATE videos SET status = 'published' WHERE id = $1`, [videoId]);
+      await sendAdminEmail(
+        'Reported Video Cleared by AI',
+        `<p>A reported video passed AI re-review and has been republished.</p>${details}</ul>`
+      );
+    }
+  } catch (err) {
+    console.error('moderateReportedVideo error (video stays under_review):', err.response?.data ?? err.message);
+    await sendAdminEmail(
+      'Video Needs Manual Review',
+      `<p>AI re-review failed for a reported video — it is hidden (status 'under_review') pending manual review.</p>${details}
+       <li><strong>Error:</strong> ${escapeHtml(err.message || 'Unknown error')}</li></ul>`
+    );
+  }
+}
+
 // ── POST /api/video/:id/report ───────────────────────────────
 const VALID_REPORT_REASONS = ['Inappropriate content', 'Copyright violation', 'Spam', 'Other'];
 
@@ -1944,15 +2075,34 @@ router.post('/video/:id/report',
   validate,
   async (req, res) => {
     try {
-      const videoCheck = await db.query('SELECT id FROM videos WHERE id = $1', [req.params.id]);
+      const videoCheck = await db.query('SELECT id, cloudflare_video_id FROM videos WHERE id = $1', [req.params.id]);
       if (!videoCheck.rows.length) return res.status(404).json({ error: 'Video not found' });
+      const video = videoCheck.rows[0];
 
       await db.query(
         'INSERT INTO video_reports (video_id, reason, reporter_clerk_id) VALUES ($1, $2, $3)',
         [req.params.id, req.body.reason, req.headers['x-clerk-user-id'] || null]
       );
 
-      res.status(201).json({ success: true });
+      const { rows: countRows } = await db.query(
+        'SELECT COUNT(*)::int AS count FROM video_reports WHERE video_id = $1',
+        [req.params.id]
+      );
+      const reportCount = countRows[0].count;
+      const thresholdReached = reportCount >= REPORT_THRESHOLD;
+
+      if (thresholdReached) {
+        await db.query(`UPDATE videos SET status = 'under_review' WHERE id = $1`, [video.id]);
+        // Not awaited — moderateReportedVideo does its own thumbnail fetch,
+        // AWS call, and email send, none of which the reporting user should
+        // have to wait on. It has full internal error handling and never
+        // throws, but .catch() here is a defensive backstop.
+        moderateReportedVideo(video.id, video.cloudflare_video_id).catch((err) => {
+          console.error('moderateReportedVideo unexpected error:', err.message);
+        });
+      }
+
+      res.status(201).json({ success: true, report_count: reportCount, threshold_reached: thresholdReached });
     } catch (err) {
       console.error('video report error:', err.message);
       res.status(500).json({ error: 'Could not submit report' });
@@ -2063,7 +2213,7 @@ router.patch('/admin/content/:id',
   [
     param('id').isUUID().withMessage('Invalid content ID'),
     query('orientation').isIn(['vertical', 'landscape', 'upload']).withMessage('orientation query param is required'),
-    body('status').isIn(['pending', 'approved', 'published', 'rejected', 'flagged']).withMessage('Invalid status'),
+    body('status').isIn(['pending', 'approved', 'published', 'rejected', 'flagged', 'under_review']).withMessage('Invalid status'),
   ],
   validate,
   async (req, res) => {
@@ -2126,20 +2276,23 @@ router.delete('/admin/content/:id',
 );
 
 // ── GET /api/admin/moderation-queue ──────────────────────────
-// Videos needing admin attention: 'rejected' (auto-rejected by AWS
-// Rekognition — worth a human sanity check) and 'flagged' (not currently
-// produced by moderateVideo() itself, but reserved for other paths — see
-// the NOTE above the videos CREATE TABLE comment).
+// Videos actively needing admin attention: 'under_review' (report-
+// triggered — see moderateReportedVideo(); includes videos AI re-review
+// couldn't resolve, left there deliberately for manual follow-up) and
+// 'flagged' (not currently produced by any automated path, reserved for
+// future use — see the NOTE above the videos CREATE TABLE comment).
+// 'rejected' is intentionally excluded: it's a terminal, already-hidden
+// state that doesn't need further action.
 router.get('/admin/moderation-queue', requireAdmin, async (req, res) => {
   try {
     const { rows } = await db.query(`
-      SELECT v.id, v.title, v.status, v.thumbnail_url, v.category, v.created_at,
+      SELECT v.id, v.title, v.status, v.cloudflare_video_id, v.thumbnail_url, v.category, v.created_at,
              v.creator_id, COALESCE(u.display_name, u.username, 'Unknown') AS creator_name,
-             (SELECT COUNT(*) FROM video_reports vr WHERE vr.video_id = v.id) AS reports_count
+             (SELECT COUNT(*)::int FROM video_reports vr WHERE vr.video_id = v.id) AS reports_count
       FROM videos v
       LEFT JOIN users u ON u.id = v.creator_id
-      WHERE v.status IN ('flagged', 'rejected')
-      ORDER BY v.created_at DESC
+      WHERE v.status IN ('under_review', 'flagged')
+      ORDER BY reports_count DESC
     `);
     res.json({ success: true, videos: rows });
   } catch (err) {

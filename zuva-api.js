@@ -4,7 +4,7 @@
  *  Suns Economy: Purchase, Tip, Cash Out
  * ============================================================
  *  Install dependencies:
- *    npm install express pg axios dotenv express-validator multer form-data
+ *    npm install express pg axios dotenv express-validator multer form-data @aws-sdk/client-rekognition
  *
  *  Required .env variables:
  *    DATABASE_URL=postgresql://user:pass@host:5432/zuva
@@ -27,6 +27,7 @@ const os         = require('os');
 const path       = require('path');
 const { randomUUID: uuidv4 } = require('crypto');
 const { body, param, query, validationResult } = require('express-validator');
+const { RekognitionClient, DetectModerationLabelsCommand } = require('@aws-sdk/client-rekognition');
 require('dotenv').config();
 
 const router = express.Router();
@@ -80,6 +81,18 @@ const cloudflareStream = axios.create({
   // Large uploads can take a while — don't let axios time the request out client-side.
   // Railway's own proxy timeout still applies and is outside this app's control.
   timeout: 0,
+});
+
+// ─── AWS Rekognition client (content moderation) ────────────────
+if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY || !process.env.AWS_REGION) {
+  console.error('[rekognition] AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION not set — content moderation will fail (videos stay pending).');
+}
+const rekognition = new RekognitionClient({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
 });
 
 // ─── Video upload middleware (multer) ──────────────────────────
@@ -1623,10 +1636,12 @@ router.post('/creator-signup',
 //    thumbnail_url        TEXT,
 //    duration_seconds     INTEGER,
 //    status               TEXT NOT NULL DEFAULT 'pending'
-//                           CHECK (status IN ('pending', 'published', 'rejected')),
+//                           CHECK (status IN ('pending', 'published', 'rejected', 'flagged')),
 //    view_count           INTEGER NOT NULL DEFAULT 0,
 //    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //  );
+//  -- If this table predates AWS Rekognition moderation, add 'flagged' to
+//  -- the existing status CHECK constraint (see moderateVideo() below).
 //
 //  CREATE TABLE video_reports (
 //    id                SERIAL PRIMARY KEY,
@@ -1636,14 +1651,50 @@ router.post('/creator-signup',
 //    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //  );
 //
-//  NOTE: there is currently no admin action anywhere that moves a video from
-//  'pending' to 'published' — the admin dashboard's Content tab only covers
-//  the older vertical_content/landscape_content tables. Until it's extended
-//  to cover `videos` too (or a dedicated publish route is added), uploads
-//  will sit at 'pending' and never appear on channel pages or the player.
+//  NOTE: moderateVideo() (below) only ever sets 'published' or 'rejected'
+//  automatically — 'flagged' is not produced by the upload pipeline itself,
+//  it's reserved for other paths (e.g. a future user-reports-triggered
+//  review, or manual admin flagging). See GET /admin/moderation-queue.
 // ============================================================
 
 const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'Lifestyle', 'Education', 'Other'];
+
+// ── Content moderation: AWS Rekognition (thumbnail-based first pass) ──
+// Rekognition's video moderation API (StartContentModeration) requires the
+// video to already live in S3, which Cloudflare Stream doesn't give us.
+// As a workaround, this runs Rekognition's synchronous IMAGE moderation
+// (DetectModerationLabels) against the video's Cloudflare Stream thumbnail:
+//   - labels found at/above MinConfidence 75 -> status = 'rejected'
+//   - no labels found                        -> status = 'published'
+// This is a weak signal — a single frame can't vouch for an entire video —
+// but per product decision a clean thumbnail is treated as sufficient for
+// auto-publish. Never throws: any failure (thumbnail not ready yet, AWS
+// error, etc.) is caught and leaves the video at its current 'pending'
+// status rather than crashing the upload request.
+async function moderateVideo(cloudflareVideoId) {
+  try {
+    const thumbnailUrl = `https://videodelivery.net/${cloudflareVideoId}/thumbnails/thumbnail.jpg`;
+    const imageRes = await axios.get(thumbnailUrl, { responseType: 'arraybuffer', timeout: 15000 });
+    const imageBytes = Buffer.from(imageRes.data);
+
+    const result = await rekognition.send(new DetectModerationLabelsCommand({
+      Image: { Bytes: imageBytes },
+      MinConfidence: 75,
+    }));
+    const labels = result.ModerationLabels || [];
+
+    if (labels.length > 0) {
+      await db.query(`UPDATE videos SET status = 'rejected' WHERE cloudflare_video_id = $1`, [cloudflareVideoId]);
+      return { safe: false, labels };
+    }
+
+    await db.query(`UPDATE videos SET status = 'published' WHERE cloudflare_video_id = $1`, [cloudflareVideoId]);
+    return { safe: true };
+  } catch (err) {
+    console.error('moderateVideo error (video stays pending):', err.response?.data ?? err.message);
+    return { safe: null, error: err.message };
+  }
+}
 
 // ── POST /api/upload/video ───────────────────────────────────
 // Identity comes from the x-clerk-user-id header (requireClerkUser), same
@@ -1712,7 +1763,16 @@ router.post('/upload/video',
         cf.uid, cf.thumbnail || null, durationSeconds,
       ]);
 
-      res.status(201).json({ success: true, video: rows[0] });
+      let video = rows[0];
+
+      // Run moderation before responding so the client gets the true final
+      // status immediately rather than a stale 'pending'. moderateVideo()
+      // never throws — on failure the video simply stays 'pending'.
+      const moderation = await moderateVideo(cf.uid);
+      if (moderation.safe === true) video = { ...video, status: 'published' };
+      else if (moderation.safe === false) video = { ...video, status: 'rejected' };
+
+      res.status(201).json({ success: true, video, moderation });
     } catch (err) {
       console.error('video upload error:', err.response?.data ?? err.message);
       res.status(500).json({ error: 'Could not upload video' });
@@ -1948,9 +2008,13 @@ router.patch('/admin/applications/:id',
 );
 
 // ── GET /api/admin/content ───────────────────────────────────
-// Content lives in two tables (vertical_content / landscape_content) —
-// this unions both and tags each row with its orientation so the
-// PATCH/DELETE routes below know which table to act on.
+// Content lives in three tables — vertical_content, landscape_content
+// (the older CloudFront-based system), and videos (Cloudflare Stream
+// uploads, orientation tagged 'upload') — this unions all three and tags
+// each row with its orientation so the PATCH/DELETE routes below know
+// which table to act on. `status` reflects moderation_status for the
+// older tables and the AWS Rekognition-driven `status` column for videos
+// (see moderateVideo() and GET /admin/moderation-queue).
 //
 // Run these migrations if your tables predate the admin dashboard:
 //   ALTER TABLE vertical_content  ADD COLUMN IF NOT EXISTS reports_count INTEGER NOT NULL DEFAULT 0;
@@ -1962,14 +2026,21 @@ router.get('/admin/content', requireAdmin, async (req, res) => {
     const { rows } = await db.query(`
       SELECT c.id, c.orientation, c.title, c.creator_id,
              COALESCE(u.display_name, u.username, 'Unknown') AS creator_name,
-             c.published_at, c.moderation_status AS status,
-             COALESCE(c.reports_count, 0) AS reports_count
+             c.published_at, c.status,
+             c.reports_count
       FROM (
-        SELECT id, 'vertical'::text AS orientation, title, creator_id, published_at, moderation_status, reports_count
+        SELECT id, 'vertical'::text AS orientation, title, creator_id, published_at,
+               moderation_status AS status, COALESCE(reports_count, 0) AS reports_count
         FROM vertical_content
         UNION ALL
-        SELECT id, 'landscape'::text AS orientation, title, creator_id, published_at, moderation_status, reports_count
+        SELECT id, 'landscape'::text AS orientation, title, creator_id, published_at,
+               moderation_status AS status, COALESCE(reports_count, 0) AS reports_count
         FROM landscape_content
+        UNION ALL
+        SELECT v.id, 'upload'::text AS orientation, v.title, v.creator_id, v.created_at AS published_at,
+               v.status,
+               (SELECT COUNT(*) FROM video_reports vr WHERE vr.video_id = v.id) AS reports_count
+        FROM videos v
       ) c
       LEFT JOIN users u ON u.id = c.creator_id
       ORDER BY c.published_at DESC NULLS LAST
@@ -1981,20 +2052,28 @@ router.get('/admin/content', requireAdmin, async (req, res) => {
   }
 });
 
-// ── PATCH /api/admin/content/:id?orientation=vertical|landscape ──
+// ── PATCH /api/admin/content/:id?orientation=vertical|landscape|upload ──
+// Status vocabulary differs by table and is passed straight through
+// without translation: vertical/landscape use pending/approved/rejected/
+// flagged (moderation_status column); videos use pending/published/
+// rejected/flagged (status column). Send the value matching the table
+// you're targeting.
 router.patch('/admin/content/:id',
   requireAdmin,
   [
     param('id').isUUID().withMessage('Invalid content ID'),
-    query('orientation').isIn(['vertical', 'landscape']).withMessage('orientation query param is required'),
-    body('status').isIn(['pending', 'approved', 'rejected', 'flagged']).withMessage('Invalid status'),
+    query('orientation').isIn(['vertical', 'landscape', 'upload']).withMessage('orientation query param is required'),
+    body('status').isIn(['pending', 'approved', 'published', 'rejected', 'flagged']).withMessage('Invalid status'),
   ],
   validate,
   async (req, res) => {
-    const table = req.query.orientation === 'vertical' ? 'vertical_content' : 'landscape_content';
+    const table = req.query.orientation === 'vertical' ? 'vertical_content'
+                : req.query.orientation === 'landscape' ? 'landscape_content'
+                : 'videos';
+    const statusColumn = req.query.orientation === 'upload' ? 'status' : 'moderation_status';
     try {
       const { rows } = await db.query(
-        `UPDATE ${table} SET moderation_status = $1 WHERE id = $2 RETURNING id, moderation_status AS status`,
+        `UPDATE ${table} SET ${statusColumn} = $1 WHERE id = $2 RETURNING id, ${statusColumn} AS status`,
         [req.body.status, req.params.id]
       );
       if (!rows.length) return res.status(404).json({ error: 'Content not found' });
@@ -2006,25 +2085,37 @@ router.patch('/admin/content/:id',
   }
 );
 
-// ── DELETE /api/admin/content/:id?orientation=vertical|landscape ──
-// Soft-deletes (sets deleted_at) instead of a hard DELETE, so it doesn't
-// break FK references from tips/ledger_entries. The public feed queries
-// already filter on deleted_at IS NULL, so this hides the content
-// immediately, same as setting status to 'rejected'.
+// ── DELETE /api/admin/content/:id?orientation=vertical|landscape|upload ──
+// vertical_content/landscape_content: soft-deletes (sets deleted_at)
+// instead of a hard DELETE, so it doesn't break FK references from tips/
+// ledger_entries. The public feed queries already filter on
+// deleted_at IS NULL, so this hides the content immediately.
+// videos: has no deleted_at column and visibility is already gated purely
+// by status = 'published' (see /api/channel/:username and /api/video/:id),
+// so "remove" just sets status = 'rejected' — equally immediate, no schema
+// change needed.
 router.delete('/admin/content/:id',
   requireAdmin,
   [
     param('id').isUUID().withMessage('Invalid content ID'),
-    query('orientation').isIn(['vertical', 'landscape']).withMessage('orientation query param is required'),
+    query('orientation').isIn(['vertical', 'landscape', 'upload']).withMessage('orientation query param is required'),
   ],
   validate,
   async (req, res) => {
-    const table = req.query.orientation === 'vertical' ? 'vertical_content' : 'landscape_content';
     try {
-      const { rows } = await db.query(
-        `UPDATE ${table} SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL RETURNING id`,
-        [req.params.id]
-      );
+      let rows;
+      if (req.query.orientation === 'upload') {
+        ({ rows } = await db.query(
+          `UPDATE videos SET status = 'rejected' WHERE id = $1 RETURNING id`,
+          [req.params.id]
+        ));
+      } else {
+        const table = req.query.orientation === 'vertical' ? 'vertical_content' : 'landscape_content';
+        ({ rows } = await db.query(
+          `UPDATE ${table} SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL RETURNING id`,
+          [req.params.id]
+        ));
+      }
       if (!rows.length) return res.status(404).json({ error: 'Content not found' });
       res.json({ success: true });
     } catch (err) {
@@ -2033,6 +2124,29 @@ router.delete('/admin/content/:id',
     }
   }
 );
+
+// ── GET /api/admin/moderation-queue ──────────────────────────
+// Videos needing admin attention: 'rejected' (auto-rejected by AWS
+// Rekognition — worth a human sanity check) and 'flagged' (not currently
+// produced by moderateVideo() itself, but reserved for other paths — see
+// the NOTE above the videos CREATE TABLE comment).
+router.get('/admin/moderation-queue', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT v.id, v.title, v.status, v.thumbnail_url, v.category, v.created_at,
+             v.creator_id, COALESCE(u.display_name, u.username, 'Unknown') AS creator_name,
+             (SELECT COUNT(*) FROM video_reports vr WHERE vr.video_id = v.id) AS reports_count
+      FROM videos v
+      LEFT JOIN users u ON u.id = v.creator_id
+      WHERE v.status IN ('flagged', 'rejected')
+      ORDER BY v.created_at DESC
+    `);
+    res.json({ success: true, videos: rows });
+  } catch (err) {
+    console.error('moderation queue fetch error:', err.message);
+    res.status(500).json({ error: 'Could not fetch moderation queue' });
+  }
+});
 
 // ── GET /api/admin/users ─────────────────────────────────────
 // Assumes users has email, country_code, role, created_at columns

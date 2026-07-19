@@ -32,6 +32,9 @@ TURNSTILE_SECRET_KEY=your_turnstile_secret_key  # verifies /api/creator-signup s
 ADMIN_EMAIL=your_admin_email@zuva.tv            # gates /api/admin/* routes (see Auth note below)
 CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
 CLOUDFLARE_API_TOKEN=your_cloudflare_stream_api_token  # /api/upload/video, /api/upload/status/:id
+AWS_ACCESS_KEY_ID=your_aws_access_key_id        # Rekognition content moderation (see below)
+AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
+AWS_REGION=us-east-1
 ```
 
 ## Architecture Notes
@@ -78,8 +81,28 @@ Custom thumbnail uploads from the frontend aren't persisted anywhere yet — no 
 Supabase Storage) is wired up in this backend, so Cloudflare's auto-generated thumbnail is always
 used regardless of what the frontend's optional thumbnail field sends.
 
-New videos always insert with `status = 'pending'` and there is currently no route that flips a video
-to `'published'` — see the NOTE above the video routes in `zuva-api.js`.
+New videos insert with `status = 'pending'`, then `moderateVideo()` runs automatically (synchronously,
+before the upload request responds) and flips status to `'published'` or `'rejected'` — see Content
+Moderation below. If moderation itself fails for any reason, the video is left at `'pending'`, and
+there is currently no separate route that manually flips a video to `'published'` from that state.
+
+### Content Moderation (AWS Rekognition)
+`moderateVideo(cloudflareVideoId)` in `zuva-api.js` runs automatically at the end of
+`POST /api/upload/video`. AWS Rekognition's video moderation API (`StartContentModeration`) requires
+the video to already live in S3, which Cloudflare Stream doesn't give us — as a workaround, this calls
+the synchronous *image* API (`DetectModerationLabels`) against the video's Cloudflare Stream thumbnail
+(`https://videodelivery.net/{id}/thumbnails/thumbnail.jpg`) as a first-pass check:
+- Labels found at/above `MinConfidence: 75` → `status = 'rejected'`
+- No labels found → `status = 'published'` (auto-publish — a product decision; a single thumbnail
+  frame can't fully vouch for an entire video, so this is a weak signal by design)
+- Any failure (thumbnail not ready yet, AWS error, network issue) → caught, video stays `'pending'`,
+  request does not crash
+
+`'flagged'` is a valid `videos.status` value but is **not** produced by `moderateVideo()` itself — it's
+reserved for other paths (e.g. a future reports-triggered review flow). `GET /api/admin/moderation-queue`
+surfaces both `'flagged'` and `'rejected'` videos for admin review. The admin dashboard's Content tab
+(`GET/PATCH/DELETE /api/admin/content`) now also covers `videos` (`?orientation=upload`), not just the
+older `vertical_content`/`landscape_content` tables.
 
 ### Health Checks
 Both `/health` and `/healthz` return:

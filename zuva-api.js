@@ -173,13 +173,12 @@ const EXCHANGE_RATE_SAFETY_SPREAD = 0.99;
 // Supported pay-in currencies and their live-to-USD rate fetch
 const SUPPORTED_FIAT_CURRENCIES = ['USD', 'GBP', 'CAD', 'AUD'];
 
-// ─── Middleware: simple auth guard (replace with your JWT middleware) ───
-const requireAuth = (req, res, next) => {
-  // In production: verify JWT from Authorization header
-  // and attach req.user = { id, walletId, role }
-  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-  next();
-};
+// ─── Middleware: auth guard (real Clerk JWT verification) ───────
+// The actual middleware is created in server.js and stored on the app.
+// This bridge makes it available to routes in this router file.
+function requireAuth(req, res, next) {
+  return req.app.get('requireAuth')(req, res, next);
+}
 
 const requireCreator = (req, res, next) => {
   if (req.user?.role !== 'creator' && req.user?.role !== 'admin') {

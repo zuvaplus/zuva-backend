@@ -37,11 +37,6 @@ app.use(morgan('combined'));
 // ─── Body parsing ─────────────────────────────────────────────
 app.use(express.json());
 
-// ─── Clerk JWT middleware ──────────────────────────────────────
-// Validates Clerk session tokens from the frontend automatically.
-const { clerkMiddleware } = require('@clerk/express');
-app.use(clerkMiddleware());
-
 // ─── Auth middleware (requires real Clerk JWT + database user lookup) ──
 const createAuthMiddleware = require('./src/middleware/requireAuth');
 const { requireAuth, requireAdmin } = createAuthMiddleware(apiPool);

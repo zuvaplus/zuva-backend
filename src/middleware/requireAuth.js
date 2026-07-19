@@ -1,17 +1,41 @@
 'use strict';
 
-const { getAuth } = require('@clerk/express');
+const { verifyToken } = require('@clerk/backend');
 
 module.exports = function createAuthMiddleware(pool) {
 
+  /**
+   * requireAuth — manually extracts and verifies the Bearer token from the
+   * Authorization header via @clerk/backend's verifyToken, then attaches
+   * req.user from the database. Never redirects — this is an API backend,
+   * so every failure path returns JSON.
+   *
+   * After this middleware, req.user = { id, role, email, countryCode, walletId }
+   */
   async function requireAuth(req, res, next) {
     try {
-      const auth = getAuth(req);
+      const authHeader = req.headers.authorization || '';
+      const [scheme, token] = authHeader.split(' ');
 
-      if (!auth || !auth.userId) {
+      if (scheme !== 'Bearer' || !token) {
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
+      let payload;
+      try {
+        payload = await verifyToken(token, {
+          secretKey: process.env.CLERK_SECRET_KEY,
+        });
+      } catch (err) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      const clerkUserId = payload.sub;
+      if (!clerkUserId) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      // Look up the user in our database by their Clerk user ID
       const result = await pool.query(
         `SELECT u.id, u.role, u.email, u.country_code AS "countryCode",
                 w.id AS "walletId"
@@ -21,7 +45,7 @@ module.exports = function createAuthMiddleware(pool) {
            AND u.deleted_at IS NULL
            AND u.status = 'active'
          LIMIT 1`,
-        [auth.userId]
+        [clerkUserId]
       );
 
       if (result.rows.length === 0) {
@@ -29,7 +53,7 @@ module.exports = function createAuthMiddleware(pool) {
       }
 
       req.user = result.rows[0];
-      req.clerkUserId = auth.userId;
+      req.clerkUserId = clerkUserId;
       next();
     } catch (err) {
       console.error('requireAuth error:', err);
@@ -37,6 +61,10 @@ module.exports = function createAuthMiddleware(pool) {
     }
   }
 
+  /**
+   * requireAdmin — extends requireAuth by also checking the user has admin role.
+   * Replaces the spoofable x-admin-email header check.
+   */
   async function requireAdmin(req, res, next) {
     await requireAuth(req, res, async () => {
       if (req.user?.role !== 'admin') {

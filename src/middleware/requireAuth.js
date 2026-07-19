@@ -74,5 +74,50 @@ module.exports = function createAuthMiddleware(pool) {
     });
   }
 
-  return { requireAuth, requireAdmin };
+  /**
+   * optionalAuth — for routes usable by both signed-in and anonymous callers
+   * (e.g. video reports). Verifies the Bearer token the same way as
+   * requireAuth when one is present, but never blocks the request: a
+   * missing, invalid, or unrecognized token just leaves req.user/
+   * req.clerkUserId unset instead of trusting an unverified client claim.
+   */
+  async function optionalAuth(req, res, next) {
+    const authHeader = req.headers.authorization || '';
+    const [scheme, token] = authHeader.split(' ');
+
+    if (scheme !== 'Bearer' || !token) {
+      return next();
+    }
+
+    try {
+      const payload = await verifyToken(token, {
+        secretKey: process.env.CLERK_SECRET_KEY,
+      });
+      const clerkUserId = payload.sub;
+      if (!clerkUserId) return next();
+
+      const result = await pool.query(
+        `SELECT u.id, u.role, u.email, u.username, u.country_code AS "countryCode",
+                w.id AS "walletId"
+         FROM users u
+         LEFT JOIN wallets w ON w.user_id = u.id
+         WHERE u.clerk_user_id = $1
+           AND u.deleted_at IS NULL
+           AND u.status = 'active'
+         LIMIT 1`,
+        [clerkUserId]
+      );
+
+      if (result.rows.length > 0) {
+        req.user = result.rows[0];
+        req.clerkUserId = clerkUserId;
+      }
+    } catch (err) {
+      // Invalid/expired token on an optional-auth route — proceed anonymously
+      // rather than blocking, same as if no token had been sent at all.
+    }
+    next();
+  }
+
+  return { requireAuth, requireAdmin, optionalAuth };
 };

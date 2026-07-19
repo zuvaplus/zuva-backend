@@ -39,9 +39,10 @@ app.use(express.json());
 
 // ─── Auth middleware (requires real Clerk JWT + database user lookup) ──
 const createAuthMiddleware = require('./src/middleware/requireAuth');
-const { requireAuth, requireAdmin } = createAuthMiddleware(apiPool);
+const { requireAuth, requireAdmin, optionalAuth } = createAuthMiddleware(apiPool);
 app.set('requireAuth', requireAuth);
 app.set('requireAdmin', requireAdmin);
+app.set('optionalAuth', optionalAuth);
 
 // ─── Routes ───────────────────────────────────────────────────
 // Specific-path limiters are mounted before the global catch-all

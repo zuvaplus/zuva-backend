@@ -198,6 +198,10 @@ function requireClerkUser(req, res, next) {
   return req.app.get('requireAuth')(req, res, next);
 }
 
+function optionalAuth(req, res, next) {
+  return req.app.get('optionalAuth')(req, res, next);
+}
+
 // ─── Validation error handler ─────────────────────────────────
 // 422 Unprocessable Entity: the request was well-formed but failed field
 // validation, as distinct from a 400 (malformed request) or 404/403.
@@ -2048,6 +2052,7 @@ async function moderateReportedVideo(videoId, cloudflareVideoId) {
 const VALID_REPORT_REASONS = ['Inappropriate content', 'Copyright violation', 'Spam', 'Other'];
 
 router.post('/video/:id/report',
+  optionalAuth,
   [
     param('id').isUUID().withMessage('Invalid video ID'),
     body('reason').isIn(VALID_REPORT_REASONS).withMessage('Invalid report reason'),
@@ -2061,7 +2066,7 @@ router.post('/video/:id/report',
 
       await db.query(
         'INSERT INTO video_reports (video_id, reason, reporter_clerk_id) VALUES ($1, $2, $3)',
-        [req.params.id, req.body.reason, req.headers['x-clerk-user-id'] || null]
+        [req.params.id, req.body.reason, req.clerkUserId || null]
       );
 
       const { rows: countRows } = await db.query(

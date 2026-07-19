@@ -188,38 +188,16 @@ const requireCreator = (req, res, next) => {
   next();
 };
 
-// ─── Middleware: admin guard ────────────────────────────────────
-// TEMPORARY, same tradeoff as requireAuth above: this trusts a caller-
-// supplied header instead of verifying a signed session, so anyone who
-// knows ADMIN_EMAIL can spoof it. Replace with real Clerk session
-// verification (e.g. @clerk/backend, checking the verified session's
-// email) before this goes to production.
-const requireAdmin = (req, res, next) => {
-  const callerEmail = req.headers['x-admin-email'];
-  if (!process.env.ADMIN_EMAIL || callerEmail !== process.env.ADMIN_EMAIL) {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  next();
-};
+// ─── Auth middleware bridges (real Clerk JWT verification) ──────
+// The actual middleware is created in server.js and stored on the app.
+// These bridges make it available to routes in this router file.
+function requireAdmin(req, res, next) {
+  return req.app.get('requireAdmin')(req, res, next);
+}
 
-// ─── Middleware: resolve the caller's DB user row from x-clerk-user-id ──
-// Same tradeoff as requireAdmin: trusts a caller-supplied header rather
-// than a verified session (matches the existing /api/user/role and
-// /api/search conventions already in this file). Attaches req.dbUser.
-const requireClerkUser = async (req, res, next) => {
-  const clerkUserId = req.headers['x-clerk-user-id'];
-  if (!clerkUserId) return res.status(400).json({ error: 'x-clerk-user-id header is required' });
-
-  try {
-    const { rows } = await db.query('SELECT * FROM users WHERE clerk_user_id = $1', [clerkUserId]);
-    if (!rows.length) return res.status(404).json({ error: 'User not found' });
-    req.dbUser = rows[0];
-    next();
-  } catch (err) {
-    console.error('requireClerkUser lookup error:', err.message);
-    res.status(500).json({ error: 'Could not verify user' });
-  }
-};
+function requireClerkUser(req, res, next) {
+  return req.app.get('requireAuth')(req, res, next);
+}
 
 // ─── Validation error handler ─────────────────────────────────
 // 422 Unprocessable Entity: the request was well-formed but failed field
@@ -1783,11 +1761,11 @@ router.post('/upload/video',
       return res.status(400).json({ error: 'A video file is required (field name "video", mp4/mov/avi, up to 2GB)' });
     }
 
-    if (req.body.creator_id && req.body.creator_id !== req.dbUser.id) {
+    if (req.body.creator_id && req.body.creator_id !== req.user.id) {
       fs.unlink(req.file.path, () => {});
       return res.status(403).json({ error: 'creator_id must match the authenticated user' });
     }
-    if (req.dbUser.role !== 'creator' && req.dbUser.role !== 'admin') {
+    if (req.user.role !== 'creator' && req.user.role !== 'admin') {
       fs.unlink(req.file.path, () => {});
       return res.status(403).json({ error: 'Creator account required' });
     }
@@ -1825,7 +1803,7 @@ router.post('/upload/video',
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING *
       `, [
-        req.dbUser.id, title, description || null, category, tags,
+        req.user.id, title, description || null, category, tags,
         cf.uid, cf.thumbnail || null, durationSeconds,
       ]);
 
@@ -1945,7 +1923,7 @@ router.patch('/channel/update',
             country_code  = COALESCE($3, country_code)
         WHERE id = $4
         RETURNING id, username, display_name, bio, country_code, avatar_url, role
-      `, [display_name ?? null, bio ?? null, country_code ?? null, req.dbUser.id]);
+      `, [display_name ?? null, bio ?? null, country_code ?? null, req.user.id]);
 
       res.json({ success: true, user: rows[0] });
     } catch (err) {
@@ -2407,7 +2385,7 @@ router.delete('/admin/users/:id',
 // ============================================================
 //  EXPORT
 // ============================================================
-module.exports = router;
+module.exports = { router, pool: db };
 
 /**
  * Attach to your Express app like this:

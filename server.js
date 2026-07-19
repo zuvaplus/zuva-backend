@@ -14,7 +14,7 @@ const {
   uploadLimiter,
 } = require('./src/middleware/rateLimiter');
 const { Pool }       = require('pg');
-const zuvaRoutes     = require('./zuva-api');
+const { router: zuvaRoutes, pool: apiPool } = require('./zuva-api');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -37,16 +37,16 @@ app.use(morgan('combined'));
 // ─── Body parsing ─────────────────────────────────────────────
 app.use(express.json());
 
-// ─── Temporary auth shim — replace with real JWT middleware later ───
-app.use((req, _res, next) => {
-  req.user = {
-    id:          '00000000-0000-0000-0000-000000000002',
-    role:        'creator',
-    email:       'test@zuva.tv',
-    countryCode: 'NG',
-  };
-  next();
-});
+// ─── Clerk JWT middleware ──────────────────────────────────────
+// Validates Clerk session tokens from the frontend automatically.
+const { clerkMiddleware } = require('@clerk/express');
+app.use(clerkMiddleware());
+
+// ─── Auth middleware (requires real Clerk JWT + database user lookup) ──
+const createAuthMiddleware = require('./src/middleware/requireAuth');
+const { requireAuth, requireAdmin } = createAuthMiddleware(apiPool);
+app.set('requireAuth', requireAuth);
+app.set('requireAdmin', requireAdmin);
 
 // ─── Routes ───────────────────────────────────────────────────
 // Specific-path limiters are mounted before the global catch-all

@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-rekognition": "^3.1090.0",
+    "@clerk/express": "^2.1.43",
     "axios": "^1.15.0",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",

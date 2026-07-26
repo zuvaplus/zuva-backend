@@ -1686,6 +1686,13 @@ router.get('/creator-signup/confirm/:token',
 
 const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'Lifestyle', 'Education', 'Other'];
 
+// Flares (short-form vertical feed) share this same videos table/upload
+// pipeline — is_flare just flags which feed a row belongs to. Enforced at
+// two points: synchronously here if Cloudflare already knows the duration,
+// and again in GET /upload/status/:videoId once Cloudflare reports it
+// asynchronously (see the NOTE there).
+const FLARE_MAX_DURATION_SECONDS = 90;
+
 // ── Content moderation: AWS Rekognition (thumbnail-based first pass) ──
 // Rekognition's video moderation API (StartContentModeration) requires the
 // video to already live in S3, which Cloudflare Stream doesn't give us.
@@ -1740,6 +1747,7 @@ router.post('/upload/video',
     body('category').trim().isIn(VALID_VIDEO_CATEGORIES).withMessage('Invalid category'),
     body('tags').optional().isString().withMessage('tags must be a comma-separated string'),
     body('creator_id').optional().isUUID().withMessage('Invalid creator_id'),
+    body('is_flare').optional().isBoolean().withMessage('is_flare must be a boolean'),
   ],
   validate,
   async (req, res) => {
@@ -1758,6 +1766,7 @@ router.post('/upload/video',
 
     const { title, description, category } = req.body;
     const tags = (req.body.tags || '').split(',').map((t) => t.trim()).filter(Boolean);
+    const isFlare = req.body.is_flare === true || req.body.is_flare === 'true';
 
     try {
       // ── Upload the file to Cloudflare Stream ────────────────
@@ -1778,6 +1787,19 @@ router.post('/upload/video',
       const cf = cfRes.data.result;
       const durationSeconds = cf.duration > 0 ? Math.round(cf.duration) : null;
 
+      // Flares are capped at 90s. Cloudflare sometimes reports duration
+      // immediately (checked here); if it doesn't yet (durationSeconds is
+      // null below), GET /upload/status/:videoId re-checks once Cloudflare
+      // reports it asynchronously and rejects the video at that point instead.
+      if (isFlare && durationSeconds !== null && durationSeconds > FLARE_MAX_DURATION_SECONDS) {
+        cloudflareStream.delete(`/${cf.uid}`).catch((delErr) =>
+          console.error('flare over-cap cleanup: could not delete Cloudflare video:', delErr.message)
+        );
+        return res.status(400).json({
+          error: `Flares must be ${FLARE_MAX_DURATION_SECONDS} seconds or under (this video is ${durationSeconds}s).`,
+        });
+      }
+
       // Note: cf.thumbnail is only reliably populated once Cloudflare finishes
       // processing — GET /upload/status/:videoId re-syncs it once ready.
       // Custom thumbnail uploads aren't wired up yet (no image storage is
@@ -1785,12 +1807,12 @@ router.post('/upload/video',
       // is used regardless of what the frontend's optional thumbnail field sends.
       const { rows } = await db.query(`
         INSERT INTO videos
-          (creator_id, title, description, category, tags, cloudflare_video_id, thumbnail_url, duration_seconds)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          (creator_id, title, description, category, tags, cloudflare_video_id, thumbnail_url, duration_seconds, is_flare)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING *
       `, [
         req.user.id, title, description || null, category, tags,
-        cf.uid, cf.thumbnail || null, durationSeconds,
+        cf.uid, cf.thumbnail || null, durationSeconds, isFlare,
       ]);
 
       let video = rows[0];
@@ -1842,7 +1864,21 @@ router.get('/upload/status/:videoId',
       const durationSeconds = cf.duration > 0 ? Math.round(cf.duration) : video.duration_seconds;
       const thumbnailUrl    = cf.thumbnail || video.thumbnail_url;
 
-      if (durationSeconds !== video.duration_seconds || thumbnailUrl !== video.thumbnail_url) {
+      // NOTE: Flare duration enforcement, part 2. POST /upload/video already
+      // rejects synchronously when Cloudflare reports duration immediately;
+      // when it doesn't (durationSeconds was null at insert time), this poll
+      // is where the real duration first becomes known — so a Flare that
+      // turns out to be over the cap gets caught and rejected here instead.
+      const flareRejected =
+        video.is_flare && video.status !== 'rejected' &&
+        durationSeconds !== null && durationSeconds > FLARE_MAX_DURATION_SECONDS;
+
+      if (flareRejected) {
+        await db.query(
+          `UPDATE videos SET duration_seconds = $1, thumbnail_url = $2, status = 'rejected' WHERE id = $3`,
+          [durationSeconds, thumbnailUrl, video.id]
+        );
+      } else if (durationSeconds !== video.duration_seconds || thumbnailUrl !== video.thumbnail_url) {
         await db.query(
           'UPDATE videos SET duration_seconds = $1, thumbnail_url = $2 WHERE id = $3',
           [durationSeconds, thumbnailUrl, video.id]
@@ -1852,7 +1888,16 @@ router.get('/upload/status/:videoId',
       res.json({
         success: true,
         processing_status: cf.status, // { state, pctComplete, errorReasonCode, errorReasonText }
-        video: { ...video, duration_seconds: durationSeconds, thumbnail_url: thumbnailUrl },
+        video: {
+          ...video,
+          duration_seconds: durationSeconds,
+          thumbnail_url: thumbnailUrl,
+          status: flareRejected ? 'rejected' : video.status,
+        },
+        ...(flareRejected ? {
+          flare_rejected: true,
+          flare_max_duration_seconds: FLARE_MAX_DURATION_SECONDS,
+        } : {}),
       });
     } catch (err) {
       console.error('upload status error:', err.response?.data ?? err.message);
@@ -2206,6 +2251,94 @@ router.patch('/channel/update',
     } catch (err) {
       console.error('channel update error:', err.message);
       res.status(500).json({ error: 'Could not update channel' });
+    }
+  }
+);
+
+// ── GET /api/flares/feed ──────────────────────────────────────
+// Paginated feed for the vertical Flares experience (/flares) — a
+// TikTok-style short-form swipe feed, completely separate from the
+// long-form browse grid. Flares live in the same `videos` table as
+// long-form uploads (is_flare just flags which feed a row belongs to)
+// and share the exact same like/comment/tip/subscribe backend; this
+// route only returns the list.
+//
+// No ranking algorithm yet — "hot" score is views-per-hour-since-posted,
+// the standard simple blend of recency + popularity (a brand-new Flare
+// only needs a few views to rank; an old one needs sustained views to
+// stay near the top). Deliberately NOT true keyset/cursor pagination:
+// a computed, time-decaying score isn't a stable sort key to page
+// against (it changes underneath you as time passes), so this uses an
+// offset encoded as an opaque base64 "cursor" instead — correct and
+// standard for score-ranked feeds (this is how Reddit/HN-style "hot"
+// pagination works), just not literal keyset pagination.
+//
+// "Already seen this session" exclusion is caller-driven rather than
+// server-persisted: the client keeps a capped list of recently-seen
+// video IDs (session/localStorage) and sends it as `exclude` — simple,
+// works for anonymous viewers too, no session table needed.
+router.get('/flares/feed',
+  optionalAuth,
+  [
+    query('cursor').optional().isString(),
+    query('limit').optional().isInt({ min: 1, max: 30 }).toInt(),
+    query('exclude').optional().isString(),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const limit = req.query.limit || 10;
+      let offset = 0;
+      if (req.query.cursor) {
+        const decoded = parseInt(Buffer.from(req.query.cursor, 'base64').toString('utf-8'), 10);
+        if (Number.isInteger(decoded) && decoded >= 0) offset = decoded;
+      }
+
+      // Cap the exclude list so a runaway client can't blow up the query —
+      // 200 is generous for "seen this session" while staying cheap.
+      const excludeIds = (req.query.exclude || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => /^[0-9a-f-]{36}$/i.test(s))
+        .slice(0, 200);
+
+      const { rows } = await db.query(`
+        SELECT v.id, v.title, v.description, v.cloudflare_video_id, v.thumbnail_url,
+               v.duration_seconds, v.view_count, v.like_count, v.comment_count,
+               v.category, v.tags, v.created_at,
+               u.id AS creator_id, u.username AS creator_username,
+               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+               COALESCE(u.follower_count, 0) AS creator_follower_count
+        FROM videos v
+        JOIN users u ON u.id = v.creator_id
+        WHERE v.status = 'published' AND v.is_flare = true
+          AND ($3::uuid[] IS NULL OR NOT (v.id = ANY($3::uuid[])))
+        ORDER BY (v.view_count::float / GREATEST(EXTRACT(EPOCH FROM (NOW() - v.created_at)) / 3600.0, 1.0)) DESC,
+                 v.created_at DESC
+        LIMIT $1 OFFSET $2
+      `, [limit + 1, offset, excludeIds.length ? excludeIds : null]);
+
+      const hasMore = rows.length > limit;
+      const page = rows.slice(0, limit).map((r) => ({
+        id: r.id, title: r.title, description: r.description,
+        cloudflare_video_id: r.cloudflare_video_id, thumbnail_url: r.thumbnail_url,
+        duration_seconds: r.duration_seconds, view_count: r.view_count,
+        like_count: r.like_count, comment_count: r.comment_count,
+        category: r.category, tags: r.tags, created_at: r.created_at,
+        creator: {
+          id: r.creator_id, username: r.creator_username, display_name: r.creator_display_name,
+          avatar_url: r.creator_avatar_url, follower_count: r.creator_follower_count,
+        },
+      }));
+
+      const nextCursor = hasMore
+        ? Buffer.from(String(offset + limit), 'utf-8').toString('base64')
+        : null;
+
+      res.json({ success: true, flares: page, nextCursor });
+    } catch (err) {
+      console.error('flares feed error:', err.message);
+      res.status(500).json({ error: 'Could not fetch Flares feed' });
     }
   }
 );

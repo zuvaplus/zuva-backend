@@ -190,6 +190,26 @@ npm run dev            # node --watch server.js
   role='creator' (requireCreator, mounted before multer so non-creators never
   stream bytes).
 
+## Flares (short-form vertical feed)
+- Same `videos` table/Cloudflare Stream pipeline as long-form uploads — `is_flare`
+  boolean flags which feed a row belongs to; the main `/feed` browse grid and
+  `/flares` swipe feed are otherwise fully separate experiences (frontend concern)
+- `FLARE_MAX_DURATION_SECONDS = 90`, enforced twice: synchronously in
+  `POST /api/upload/video` when Cloudflare already knows the duration (deletes the
+  Cloudflare video + rejects with 400), and again in `GET /upload/status/:videoId`
+  once Cloudflare reports it asynchronously (flips `status` to `'rejected'`,
+  response includes `flare_rejected: true`)
+- `GET /api/flares/feed?cursor=&limit=&exclude=` — optionalAuth, ranks by a simple
+  views-per-hour-since-posted "hot" score (no ranking algorithm yet, this is the
+  documented simple fallback). `cursor` is an opaque base64-encoded offset, not
+  true keyset pagination — a time-decaying score isn't a stable sort key to page
+  against, so this is the standard approach for score-ranked feeds. `exclude` is a
+  client-supplied comma-separated list of already-seen video IDs (capped at 200) —
+  session tracking is caller-driven, not server-persisted, so it works for
+  anonymous viewers too
+- Likes/comments/tips/subscriptions are the exact same endpoints long-form videos
+  use — nothing Flare-specific there
+
 ## Video Captions (Cloudflare Stream)
 - No local table — Cloudflare Stream is the sole source of truth for which caption
   tracks exist on a video (same philosophy as `thumbnail_url`/`duration_seconds`

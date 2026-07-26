@@ -922,282 +922,315 @@ router.get('/creator/earnings/:creatorId',
 
 
 // ============================================================
-//  DISCOVERY ENGINE  —  Routes added in v1.1
-// ============================================================
-
-// ─── SQL identifier whitelists ──────────────────────────────────
-// Postgres can't parameterize table/view names ($1 etc. only binds values),
-// so orientation is mapped through these fixed lookup tables instead of
-// being interpolated directly — a lookup can only ever produce one of
-// these exact literal strings, never arbitrary input.
-const CONTENT_TABLE_BY_ORIENTATION = {
-  vertical:  'vertical_content',
-  landscape: 'landscape_content',
-};
-const TRENDING_VIEW_BY_ORIENTATION = {
-  vertical:  'trending_vertical_24h',
-  landscape: 'trending_landscape_24h',
-};
-
-// ─── Discovery constants ──────────────────────────────────────
-// Feed composition: what percentage of each slot type
-const FEED_MIX = {
-  TRENDING:     0.50,   // 50% — Suns earned in the last 24 hours
-  PERSONALIZED: 0.40,   // 40% — matches user's highest-weighted tags
-  WILDCARD:     0.10,   // 10% — random content for serendipitous discovery
-};
-
-// Interest weight constants (must match the PostgreSQL function)
-const INTEREST_DECAY  = 0.97;
-const INTEREST_INCREMENT = 1.0;
-
-// Tags to increment per video completion (max 5 to prevent noise)
-const MAX_TAGS_PER_COMPLETION = 5;
-
-
-// ============================================================
-//  ROUTE 8: POST /api/feed/view-complete
-//  Called by the client when a user finishes (or nearly finishes)
-//  watching a video. This is the event that drives the interest graph.
+//  MAIN FEED RANKING
 //
-//  "Completion" rules:
-//    - Vertical content:   watched ≥ 80% of duration
-//    - Landscape content:  watched ≥ 70% of duration
-//    - Partial views still record to content_views for analytics
-//    - Only COMPLETED views update user_interests (tag weights)
+//  Replaces the old "Discovery Engine" above, which referenced tables
+//  (vertical_content, landscape_content, content_views, user_interests)
+//  and a function (upsert_user_interest) that don't exist against the
+//  real schema — that code predates the current single `videos` table
+//  design and was never reconciled with it, which is why GET
+//  /feed/recommended 500'd with "Could not generate recommended feed"
+//  and POST /feed/view-complete silently failed on every call. Both are
+//  replaced below by GET /api/feed and POST /api/feed/watch-progress,
+//  built against the real videos/users/tips/watch_events tables.
 //
-//  The client should fire this endpoint:
-//    - When the IntersectionObserver detects the user scrolled AWAY
-//      from a vertical video (captures how far they got)
-//    - When the video's 'ended' event fires for landscape content
-//    - When the user manually closes the player
+//  Signals combined by computeFeedScore, per video:
+//    - completion rate  (avg of watch_events.completion_pct)  — highest weight
+//    - tips_received    (SUM(tips.amount_suns) by content_id) — highest of the engagement signals
+//    - comments         (videos.comment_count)                — weighted higher for Documentary & Discussion
+//    - likes            (videos.like_count)
+//    - view_count       (videos.view_count)                   — de-emphasized for Documentary & Discussion
+//    - recency          gentle exponential decay, long half-life
+//    - country match    small additive boost, never a filter
+//
+//  See CLAUDE.md for the full writeup, including the two known gaps:
+//  no per-video language signal exists yet (so the "language" half of
+//  the country/language boost is inert), and `content_category` is a
+//  separate column from the older `category` (VALID_VIDEO_CATEGORIES).
 // ============================================================
-router.post('/feed/view-complete',
-  requireAuth,
+
+// content_category taxonomy. Separate from VALID_VIDEO_CATEGORIES (the
+// older `category` column), which stays as-is — see the migration file
+// for why these two fields coexist.
+const CONTENT_CATEGORIES = [
+  'entertainment', 'music', 'comedy', 'drama_series', 'documentary',
+  'discussion_debate', 'interview', 'lifestyle_culture', 'news', 'other',
+];
+
+// The "Documentary & Discussion" umbrella — a code-level grouping only,
+// not a DB concept. Gets protected feed placement (the category floor,
+// below) and different score weighting: completion rate matters even
+// more, raw view count matters less.
+const DOC_DISCUSSION_CATEGORIES = ['documentary', 'discussion_debate', 'interview', 'lifestyle_culture'];
+
+// Feed page composition. "Page" here means each successive window of
+// `limit` items in the assembled feed, not just the first one — see
+// buildRankedFeed, which assembles the whole ordered feed in rounds of
+// `limit` so the floors hold on every page a viewer scrolls to, not just
+// page one.
+const DOC_DISCUSSION_FLOOR_RATIO = 1 / 8;  // ~1 in 8 reserved for Documentary & Discussion
+const DIVERSITY_FLOOR_RATIO      = 1 / 6;  // a further slice reserved so one category can't dominate a page
+
+// Gentle recency decay — long-form ages well, so this half-life is long
+// (a video this many days old has its recency contribution halved).
+const FEED_RECENCY_HALF_LIFE_DAYS = 21;
+
+// Relative weights — see the header comment above for the reasoning
+// behind each. Coefficients, not hard caps: an extreme outlier on one
+// signal (e.g. a huge tip) can still out-rank typical values on another,
+// which is expected of a linear heuristic score like this one.
+const FEED_WEIGHTS = {
+  COMPLETION:                100,  // highest overall — the single strongest signal
+  COMPLETION_DOC_DISCUSSION:  150, // even more so for Documentary & Discussion
+  TIPS:                       40,  // highest of the engagement-only signals — a Sun spent is the strongest signal
+  COMMENTS:                   12,
+  COMMENTS_DOC_DISCUSSION:    24,  // comments signal engagement-with-ideas for this category specifically
+  LIKES:                      10,
+  VIEWS:                      10,
+  VIEWS_DOC_DISCUSSION:        2,  // de-emphasized — a high-completion, modest-view documentary should still win
+  RECENCY:                    10,
+  COUNTRY_MATCH_BOOST:         6,  // small and additive, never a filter
+};
+
+function clamp01(n) {
+  return Math.max(0, Math.min(1, n));
+}
+
+/**
+ * computeFeedScore(video, viewer)
+ * video:  { content_category, avg_completion_pct, tips_received, like_count,
+ *           comment_count, view_count, created_at, creator_country_code }
+ * viewer: { preferred_country, preferred_languages } | null (anonymous/no prefs)
+ */
+function computeFeedScore(video, viewer) {
+  const isDocDiscussion = DOC_DISCUSSION_CATEGORIES.includes(video.content_category);
+
+  const completion = clamp01((video.avg_completion_pct ?? 0) / 100);
+  const completionWeight = isDocDiscussion
+    ? FEED_WEIGHTS.COMPLETION_DOC_DISCUSSION
+    : FEED_WEIGHTS.COMPLETION;
+
+  const tipsScore    = Math.log10(1 + (video.tips_received ?? 0));
+  const likesScore   = Math.log10(1 + (video.like_count ?? 0));
+  const commentsScore = Math.log10(1 + (video.comment_count ?? 0));
+  const commentsWeight = isDocDiscussion ? FEED_WEIGHTS.COMMENTS_DOC_DISCUSSION : FEED_WEIGHTS.COMMENTS;
+  const viewsScore   = Math.log10(1 + (video.view_count ?? 0));
+  const viewsWeight  = isDocDiscussion ? FEED_WEIGHTS.VIEWS_DOC_DISCUSSION : FEED_WEIGHTS.VIEWS;
+
+  const ageDays = Math.max(0, (Date.now() - new Date(video.created_at).getTime()) / 86400000);
+  const recency = Math.pow(0.5, ageDays / FEED_RECENCY_HALF_LIFE_DAYS);
+
+  // Language has no per-video signal to match against yet (see header
+  // comment) — only country contributes today.
+  let affinityBoost = 0;
+  if (viewer?.preferred_country && video.creator_country_code
+      && viewer.preferred_country === video.creator_country_code) {
+    affinityBoost += FEED_WEIGHTS.COUNTRY_MATCH_BOOST;
+  }
+
+  return (
+    completion * completionWeight +
+    tipsScore * FEED_WEIGHTS.TIPS +
+    likesScore * FEED_WEIGHTS.LIKES +
+    commentsScore * commentsWeight +
+    viewsScore * viewsWeight +
+    recency * FEED_WEIGHTS.RECENCY +
+    affinityBoost
+  );
+}
+
+/**
+ * assembleFeedRound
+ * Builds one page-sized (`limit`) round out of the still-unused scored
+ * candidates: first the Documentary & Discussion floor, then a general
+ * diversity floor (a few slots reserved for categories not yet
+ * represented in this round), then the rest filled by pure score. The
+ * round is re-sorted by score at the end so the floor items don't read
+ * as a visibly separate block bolted onto the page.
+ */
+function assembleFeedRound(scoredDocDiscussion, scoredAll, usedIds, limit) {
+  const chosen = [];
+  const docFloorCount = Math.max(1, Math.round(limit * DOC_DISCUSSION_FLOOR_RATIO));
+  const diversityFloorCount = Math.max(1, Math.round(limit * DIVERSITY_FLOOR_RATIO));
+
+  for (const c of scoredDocDiscussion) {
+    if (chosen.length >= docFloorCount) break;
+    if (usedIds.has(c.id)) continue;
+    chosen.push(c);
+    usedIds.add(c.id);
+  }
+
+  const categoryCounts = new Map();
+  for (const c of chosen) {
+    categoryCounts.set(c.content_category, (categoryCounts.get(c.content_category) || 0) + 1);
+  }
+
+  let diversityAdded = 0;
+  for (const c of scoredAll) {
+    if (diversityAdded >= diversityFloorCount || chosen.length >= limit) break;
+    if (usedIds.has(c.id)) continue;
+    if ((categoryCounts.get(c.content_category) || 0) >= 1) continue;
+    chosen.push(c);
+    usedIds.add(c.id);
+    categoryCounts.set(c.content_category, 1);
+    diversityAdded++;
+  }
+
+  for (const c of scoredAll) {
+    if (chosen.length >= limit) break;
+    if (usedIds.has(c.id)) continue;
+    chosen.push(c);
+    usedIds.add(c.id);
+  }
+
+  chosen.sort((a, b) => b._score - a._score);
+  return chosen;
+}
+
+/**
+ * buildRankedFeed
+ * Scores every candidate once, then assembles the full ordered feed in
+ * `limit`-sized rounds (each with its own category floors applied) until
+ * there's enough to satisfy `offset + limit`, then slices that window.
+ * Works identically for anonymous viewers (viewer = null) — with no
+ * preferred_country and no watch/tip/like history to speak of yet, the
+ * score collapses to trending + recency + the same category floors,
+ * which is exactly the "don't personalize into nothing" fallback.
+ */
+function buildRankedFeed(candidates, viewer, offset, limit) {
+  const scored = candidates.map((v) => ({ ...v, _score: computeFeedScore(v, viewer) }));
+  const scoredAll = [...scored].sort((a, b) => b._score - a._score);
+  const scoredDocDiscussion = scoredAll.filter((v) => DOC_DISCUSSION_CATEGORIES.includes(v.content_category));
+
+  const usedIds = new Set();
+  const assembled = [];
+  while (assembled.length < offset + limit && usedIds.size < candidates.length) {
+    const round = assembleFeedRound(scoredDocDiscussion, scoredAll, usedIds, limit);
+    if (round.length === 0) break; // no more unused candidates
+    assembled.push(...round);
+  }
+
+  return assembled.slice(offset, offset + limit);
+}
+
+// Candidate pool cap — this platform is pre-launch with a modest video
+// count, so scoring/assembling in application memory over the most
+// recent N published videos is simple and fast. Revisit (push scoring
+// into SQL, or paginate the candidate fetch) once the catalog is large
+// enough that fetching this many rows per request stops being cheap.
+const FEED_CANDIDATE_POOL_SIZE = 500;
+
+// ============================================================
+//  GET /api/feed
+//  Scored, category-floor-adjusted, paginated main feed. Works for
+//  anonymous viewers (optionalAuth) — see buildRankedFeed's fallback
+//  behavior above. Excludes Flares (is_flare = true) entirely; Flares
+//  has its own separate feed and ranking (GET /api/flares/feed).
+// ============================================================
+router.get('/feed',
+  optionalAuth,
   [
-    body('contentId').isUUID().withMessage('Invalid content ID'),
-    body('orientation').isIn(['vertical', 'landscape']).withMessage('Invalid orientation'),
-    body('watchDurationSeconds').isInt({ min: 0 }).withMessage('Invalid watch duration'),
-    body('totalDurationSeconds').isInt({ min: 1 }).withMessage('Invalid total duration'),
+    query('limit').optional().isInt({ min: 1, max: 50 }).toInt(),
+    query('offset').optional().isInt({ min: 0 }).toInt(),
   ],
   validate,
   async (req, res) => {
-    const {
-      contentId,
-      orientation,
-      watchDurationSeconds,
-      totalDurationSeconds,
-    } = req.body;
-    const userId = req.user.id;
-
-    // Determine if this counts as a "completion" for interest-weight purposes
-    const completionThreshold = orientation === 'vertical' ? 0.80 : 0.70;
-    const watchRatio          = watchDurationSeconds / totalDurationSeconds;
-    const isCompleted         = watchRatio >= completionThreshold;
-
-    const client = await db.connect();
-    try {
-      await client.query('BEGIN');
-
-      // ── Step 1: Fetch content tags ─────────────────────────
-      // We need the content's ai_generated_tags to know which
-      // interests to reinforce in the user's interest graph.
-      const table  = CONTENT_TABLE_BY_ORIENTATION[orientation]; // orientation validated via isIn(['vertical','landscape']) above
-      const tagRes = await client.query(
-        `SELECT ai_generated_tags, creator_id FROM ${table} WHERE id = $1`,
-        [contentId]
-      );
-
-      if (!tagRes.rows.length) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'Content not found' });
-      }
-
-      const { ai_generated_tags: tags, creator_id: creatorId } = tagRes.rows[0];
-
-      // ── Step 2: Record the view in content_views ───────────
-      // Always recorded — even partial views count for analytics.
-      await client.query(`
-        INSERT INTO content_views
-          (viewer_id, content_id, orientation, watch_duration_seconds, completed, country_code)
-        VALUES ($1, $2, $3, $4, $5, $6)
-      `, [userId, contentId, orientation, watchDurationSeconds, isCompleted,
-          req.user.countryCode || null]);
-
-      // ── Step 3: Increment view_count on content ────────────
-      await client.query(
-        `UPDATE ${table} SET view_count = view_count + 1 WHERE id = $1`,
-        [contentId]
-      );
-
-      // ── Step 4: Update user_interests (only on completion) ─
-      // We call upsert_user_interest() once per tag.
-      // We limit to MAX_TAGS_PER_COMPLETION tags to avoid weighting
-      // noise from content that has many generic tags.
-      let updatedTags = [];
-      if (isCompleted && tags && tags.length > 0) {
-        const tagsToProcess = tags.slice(0, MAX_TAGS_PER_COMPLETION);
-        updatedTags         = tagsToProcess;
-
-        for (const tag of tagsToProcess) {
-          await client.query(
-            'SELECT upsert_user_interest($1, $2, $3)',
-            [userId, tag.toLowerCase(), orientation]
-          );
-        }
-      }
-
-      await client.query('COMMIT');
-
-      res.json({
-        success:       true,
-        contentId,
-        orientation,
-        watchRatio:    parseFloat(watchRatio.toFixed(3)),
-        isCompleted,
-        interestsUpdated: updatedTags,
-        message: isCompleted
-          ? `Interests updated: [${updatedTags.join(', ')}]`
-          : `Partial view recorded (${Math.round(watchRatio * 100)}% — threshold ${completionThreshold * 100}%)`,
-      });
-
-    } catch (err) {
-      await client.query('ROLLBACK');
-      console.error('view-complete error:', err.message);
-      res.status(500).json({ error: 'Could not record view' });
-    } finally {
-      client.release();
-    }
-  }
-);
-
-
-// ============================================================
-//  ROUTE 9: GET /api/feed/recommended
-//  The Discovery Engine — returns a curated mixed feed.
-//
-//  Query params:
-//    orientation  'vertical' | 'landscape' | 'both' (default: 'both')
-//    limit        total items to return (default: 30)
-//    offset       for pagination (default: 0)
-//
-//  Algorithm:
-//    Given limit = 30:
-//      trending_n     = Math.floor(30 × 0.50) = 15 items
-//      personalized_n = Math.floor(30 × 0.40) = 12 items
-//      wildcard_n     = 30 - 15 - 12          = 3  items  (remainder)
-//
-//    Each bucket is fetched separately via SQL, then:
-//      1. Results are deduplicated by content ID across all three buckets
-//      2. Trending content anchors the top positions
-//      3. Personalized content fills the middle
-//      4. Wildcard items are randomly distributed at the end
-//
-//  For unauthenticated users: returns trending + wildcard only
-//  (no personalization without an interest graph to query)
-// ============================================================
-router.get('/feed/recommended',
-  requireAuth,
-  async (req, res) => {
-    const orientation = req.query.orientation || 'both';
-    const limit       = Math.min(parseInt(req.query.limit) || 30, 100);
-    const userId      = req.user.id;
-
-    // ── Slot allocation ─────────────────────────────────────
-    const trendingN     = Math.floor(limit * FEED_MIX.TRENDING);
-    const personalizedN = Math.floor(limit * FEED_MIX.PERSONALIZED);
-    const wildcardN     = limit - trendingN - personalizedN;  // absorbs rounding
-
-    // Track IDs already allocated to avoid cross-bucket duplicates
-    const usedIds = new Set();
+    const limit  = req.query.limit || 30;
+    const offset = req.query.offset || 0;
 
     try {
-      // ── BUCKET 1: TRENDING ─────────────────────────────────
-      // Uses the trending_vertical_24h / trending_landscape_24h views
-      // which pre-join tip sums. Falls back to most-viewed if no
-      // tips have been made in the last 24h (common early on).
-      const trendingResults = await fetchTrending(db, orientation, trendingN);
-      trendingResults.forEach(r => usedIds.add(r.id));
+      let viewer = null;
+      if (req.user) {
+        const { rows: viewerRows } = await db.query(
+          `SELECT preferred_country, preferred_languages FROM users WHERE id = $1`,
+          [req.user.id]
+        );
+        viewer = viewerRows[0] || null;
+      }
 
-      // ── BUCKET 2: PERSONALIZED ─────────────────────────────
-      // Fetches the user's top-weighted tags, then finds content
-      // whose ai_generated_tags array overlaps — weighted by how
-      // well the content matches the user's interest profile.
-      const personalizedResults = await fetchPersonalized(
-        db, userId, orientation, personalizedN, usedIds
-      );
-      personalizedResults.forEach(r => usedIds.add(r.id));
+      const { rows } = await db.query(`
+        SELECT v.id, v.title, v.description, v.cloudflare_video_id, v.thumbnail_url,
+               v.duration_seconds, v.view_count, v.like_count, v.comment_count,
+               v.category, v.content_category, v.tags, v.created_at,
+               u.id AS creator_id, u.username AS creator_username,
+               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+               u.country_code AS creator_country_code,
+               COALESCE(u.follower_count, 0) AS creator_follower_count,
+               COALESCE(we.avg_completion_pct, 0) AS avg_completion_pct,
+               COALESCE(t.tips_received, 0) AS tips_received
+        FROM videos v
+        JOIN users u ON u.id = v.creator_id
+        LEFT JOIN (
+          SELECT video_id, AVG(completion_pct) AS avg_completion_pct
+          FROM watch_events
+          GROUP BY video_id
+        ) we ON we.video_id = v.id
+        LEFT JOIN (
+          SELECT content_id, SUM(amount_suns) AS tips_received
+          FROM tips
+          WHERE content_id IS NOT NULL
+          GROUP BY content_id
+        ) t ON t.content_id = v.id
+        WHERE v.status = 'published' AND v.is_flare = false
+        ORDER BY v.created_at DESC
+        LIMIT $1
+      `, [FEED_CANDIDATE_POOL_SIZE]);
 
-      // ── BUCKET 3: WILDCARD ──────────────────────────────────
-      // Pure random content the user hasn't already seen in this
-      // feed response. This is the discovery valve — it surfaces
-      // creators and genres outside the user's current interest graph.
-      const wildcardResults = await fetchWildcard(
-        db, orientation, wildcardN, usedIds
-      );
-
-      // ── Assembly ────────────────────────────────────────────
-      // Tag each item with its source bucket for client-side
-      // analytics (you want to know which bucket drives engagement).
-      const feed = [
-        ...trendingResults.map(r => ({ ...r, _bucket: 'trending' })),
-        ...personalizedResults.map(r => ({ ...r, _bucket: 'personalized' })),
-        ...wildcardResults.map(r => ({ ...r, _bucket: 'wildcard' })),
-      ];
-
-      // ── Feed diagnostics (strip from production if needed) ──
-      const diagnostics = {
-        requested:    limit,
-        delivered:    feed.length,
-        trending:     trendingResults.length,
-        personalized: personalizedResults.length,
-        wildcard:     wildcardResults.length,
-        mix: {
-          trending_pct:     ((trendingResults.length / feed.length) * 100).toFixed(1) + '%',
-          personalized_pct: ((personalizedResults.length / feed.length) * 100).toFixed(1) + '%',
-          wildcard_pct:     ((wildcardResults.length / feed.length) * 100).toFixed(1) + '%',
+      const page = buildRankedFeed(rows, viewer, offset, limit).map((r) => ({
+        id: r.id, title: r.title, description: r.description,
+        cloudflare_video_id: r.cloudflare_video_id, thumbnail_url: r.thumbnail_url,
+        duration_seconds: r.duration_seconds, view_count: r.view_count,
+        like_count: r.like_count, comment_count: r.comment_count,
+        category: r.category, content_category: r.content_category,
+        tags: r.tags, created_at: r.created_at,
+        creator: {
+          id: r.creator_id, username: r.creator_username, display_name: r.creator_display_name,
+          avatar_url: r.creator_avatar_url, follower_count: r.creator_follower_count,
         },
-      };
+      }));
 
-      res.json({ success: true, feed, diagnostics });
-
+      res.json({ success: true, feed: page });
     } catch (err) {
-      console.error('recommended feed error:', err.message);
-      res.status(500).json({ error: 'Could not generate recommended feed' });
+      console.error('feed error:', err.message);
+      res.status(500).json({ error: 'Could not generate feed' });
     }
   }
 );
 
-
 // ============================================================
-//  ROUTE 10: GET /api/feed/user-interests
-//  Returns the user's current interest graph for display
-//  (useful for a "Your Tastes" profile section)
+//  POST /api/feed/watch-progress
+//  Records one granular watch_events row — the missing signal
+//  computeFeedScore's completion rate depends on. The client fires this
+//  periodically (every 10-15s of playback) and on pause/unload, not just
+//  once at the end, so completion rate reflects real viewing behavior
+//  rather than a single on-leave guess. Anonymous viewers still
+//  contribute signal (user_id is nullable) — optionalAuth, not requireAuth.
 // ============================================================
-router.get('/feed/user-interests', requireAuth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 20, 50);
-  try {
-    const { rows } = await db.query(`
-      SELECT
-        tag,
-        weight,
-        view_count,
-        vertical_completions,
-        landscape_completions,
-        updated_at,
-        -- Normalise weight to 0–100 for display
-        ROUND((weight / NULLIF((SELECT MAX(weight) FROM user_interests WHERE user_id = $1), 0)) * 100) AS strength_pct
-      FROM user_interests
-      WHERE user_id = $1
-      ORDER BY weight DESC
-      LIMIT $2
-    `, [req.user.id, limit]);
+router.post('/feed/watch-progress',
+  optionalAuth,
+  [
+    body('videoId').isUUID().withMessage('Invalid video ID'),
+    body('watchedSeconds').isInt({ min: 0 }).withMessage('Invalid watched seconds'),
+    body('videoDurationSeconds').isInt({ min: 1 }).withMessage('Invalid video duration'),
+  ],
+  validate,
+  async (req, res) => {
+    const { videoId, watchedSeconds, videoDurationSeconds } = req.body;
+    const completionPct = Math.min(100, (watchedSeconds / videoDurationSeconds) * 100);
 
-    res.json({ success: true, interests: rows, count: rows.length });
-  } catch (err) {
-    res.status(500).json({ error: 'Could not fetch interests' });
+    try {
+      await db.query(`
+        INSERT INTO watch_events (video_id, user_id, watched_seconds, video_duration_seconds, completion_pct)
+        VALUES ($1, $2, $3, $4, $5)
+      `, [videoId, req.user?.id || null, watchedSeconds, videoDurationSeconds, completionPct.toFixed(2)]);
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error('watch-progress error:', err.message);
+      res.status(500).json({ error: 'Could not record watch progress' });
+    }
   }
-});
+);
 
 
 // ============================================================
@@ -1296,178 +1329,6 @@ router.get('/search',
     }
   }
 );
-
-
-// ============================================================
-//  HELPERS  —  The three feed bucket fetchers
-//
-//  These are module-level async functions (not route handlers).
-//  Each returns a plain array of content row objects.
-//  They accept a `usedIds` Set to enforce cross-bucket deduplication.
-// ============================================================
-
-/**
- * fetchTrending
- * Returns content with the highest Sun earnings in the last 24h.
- * Falls back to highest all-time view_count if the tips table is sparse.
- */
-async function fetchTrending(db, orientation, limit) {
-  if (limit <= 0) return [];
-
-  // Build orientation filter — one or both tables
-  const orientations = orientation === 'both' ? ['vertical', 'landscape']
-                     : [orientation];
-
-  const results = [];
-
-  for (const o of orientations) {
-    const view   = TRENDING_VIEW_BY_ORIENTATION[o]; // o is always 'vertical' or 'landscape' — see orientations above
-    const perO   = Math.ceil(limit / orientations.length);
-
-    const { rows } = await db.query(`
-      SELECT
-        id, creator_id, title, duration_seconds,
-        cloudfront_url, thumbnail_url, ai_generated_tags,
-        view_count, like_count, total_tips_suns,
-        orientation, trending_suns_24h, trending_tip_count_24h,
-        -- If nothing trended today, fall back to all-time popularity
-        CASE
-          WHEN trending_suns_24h > 0 THEN trending_suns_24h
-          ELSE view_count * 0.1           -- synthetic score for fallback
-        END AS sort_score
-      FROM ${view}
-      ORDER BY sort_score DESC
-      LIMIT $1
-    `, [perO]);
-
-    results.push(...rows);
-  }
-
-  return results;
-}
-
-/**
- * fetchPersonalized
- * Scores content by how well its tags overlap with the user's
- * interest graph. The relevance_score is a SUM of the user's
- * weight for each matching tag — so content tagged with both
- * 'nollywood' (weight 8.2) and 'crime' (weight 5.1) scores 13.3.
- *
- * Filters out content the user has already watched (content_views).
- * Filters out content already allocated to the trending bucket (usedIds).
- */
-async function fetchPersonalized(db, userId, orientation, limit, usedIds) {
-  if (limit <= 0) return [];
-
-  // Convert usedIds Set to an array for the SQL NOT IN clause
-  // If empty, use a dummy UUID to avoid syntax errors
-  const excluded = usedIds.size > 0
-    ? [...usedIds]
-    : ['00000000-0000-0000-0000-000000000000'];
-
-  const orientations = orientation === 'both' ? ['vertical', 'landscape'] : [orientation];
-  const results = [];
-
-  for (const o of orientations) {
-    const table = CONTENT_TABLE_BY_ORIENTATION[o]; // o is always 'vertical' or 'landscape' — see orientations above
-    const perO  = Math.ceil(limit / orientations.length);
-
-    // This query is the core of the personalisation engine.
-    // It joins content against the user's interest weights via tag overlap.
-    //
-    // UNNEST(c.ai_generated_tags) expands the tags array into rows so we
-    // can JOIN against user_interests on a single tag value.
-    // The GROUP BY + SUM aggregates the matching weights into a relevance score.
-    const { rows } = await db.query(`
-      SELECT
-        c.id,
-        c.creator_id,
-        c.title,
-        c.duration_seconds,
-        c.cloudfront_url,
-        c.thumbnail_url,
-        c.ai_generated_tags,
-        c.view_count,
-        c.like_count,
-        c.total_tips_suns,
-        $3::text                        AS orientation,
-        SUM(ui.weight)                  AS relevance_score,
-        ARRAY_AGG(DISTINCT ui.tag)      AS matched_tags   -- tags that matched (for debugging)
-      FROM ${table} c
-      -- Expand the tags array into individual rows for join
-      JOIN LATERAL UNNEST(c.ai_generated_tags) AS tag(val) ON TRUE
-      -- Match against user's interest weights
-      JOIN user_interests ui
-        ON ui.tag     = tag.val
-        AND ui.user_id = $1
-      WHERE
-        c.moderation_status = 'approved'
-        AND c.published_at  IS NOT NULL
-        AND c.deleted_at    IS NULL
-        -- Exclude content already in the trending bucket
-        AND c.id            NOT IN (SELECT UNNEST($4::uuid[]))
-        -- Exclude content this user has already completed
-        AND c.id NOT IN (
-          SELECT content_id FROM content_views
-          WHERE viewer_id  = $1
-            AND orientation = $3
-            AND completed   = TRUE
-        )
-      GROUP BY c.id, c.creator_id, c.title, c.duration_seconds,
-               c.cloudfront_url, c.thumbnail_url, c.ai_generated_tags,
-               c.view_count, c.like_count, c.total_tips_suns
-      ORDER BY relevance_score DESC
-      LIMIT $2
-    `, [userId, perO, o, excluded]);
-
-    results.push(...rows);
-  }
-
-  return results;
-}
-
-/**
- * fetchWildcard
- * Pure randomness via ORDER BY RANDOM().
- * Filters out content already allocated to trending + personalized.
- * This intentionally surfaces creators and tags the user has
- * never interacted with, breaking the filter-bubble effect.
- *
- * In production at scale: replace RANDOM() with a reservoir
- * sampling approach or a pre-computed random bucket refreshed hourly,
- * because ORDER BY RANDOM() is slow on large tables (full sequential scan).
- */
-async function fetchWildcard(db, orientation, limit, usedIds) {
-  if (limit <= 0) return [];
-
-  const excluded    = usedIds.size > 0 ? [...usedIds] : ['00000000-0000-0000-0000-000000000000'];
-  const orientations = orientation === 'both' ? ['vertical', 'landscape'] : [orientation];
-  const results = [];
-
-  for (const o of orientations) {
-    const table = CONTENT_TABLE_BY_ORIENTATION[o]; // o is always 'vertical' or 'landscape' — see orientations above
-    const perO  = Math.ceil(limit / orientations.length);
-
-    const { rows } = await db.query(`
-      SELECT
-        id, creator_id, title, duration_seconds,
-        cloudfront_url, thumbnail_url, ai_generated_tags,
-        view_count, like_count, total_tips_suns,
-        $3::text AS orientation
-      FROM ${table}
-      WHERE moderation_status = 'approved'
-        AND published_at      IS NOT NULL
-        AND deleted_at        IS NULL
-        AND id NOT IN (SELECT UNNEST($2::uuid[]))
-      ORDER BY RANDOM()
-      LIMIT $1
-    `, [perO, excluded, o]);
-
-    results.push(...rows);
-  }
-
-  return results;
-}
 
 
 // ============================================================
@@ -1686,6 +1547,10 @@ router.get('/creator-signup/confirm/:token',
 
 const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'Lifestyle', 'Education', 'Other'];
 
+// See CONTENT_CATEGORIES near the feed-ranking code above (search
+// "MAIN FEED RANKING") for the richer taxonomy videos.content_category
+// uses — required on upload, distinct from the category field above.
+
 // Flares (short-form vertical feed) share this same videos table/upload
 // pipeline — is_flare just flags which feed a row belongs to. Enforced at
 // two points: synchronously here if Cloudflare already knows the duration,
@@ -1745,6 +1610,7 @@ router.post('/upload/video',
     body('title').trim().notEmpty().isLength({ max: 200 }).withMessage('Title is required (max 200 characters)'),
     body('description').optional().trim().isLength({ max: 2000 }).withMessage('Description must be at most 2000 characters'),
     body('category').trim().isIn(VALID_VIDEO_CATEGORIES).withMessage('Invalid category'),
+    body('content_category').trim().isIn(CONTENT_CATEGORIES).withMessage('Invalid content_category'),
     body('tags').optional().isString().withMessage('tags must be a comma-separated string'),
     body('creator_id').optional().isUUID().withMessage('Invalid creator_id'),
     body('is_flare').optional().isBoolean().withMessage('is_flare must be a boolean'),
@@ -1764,7 +1630,7 @@ router.post('/upload/video',
       return res.status(403).json({ error: 'Creator account required' });
     }
 
-    const { title, description, category } = req.body;
+    const { title, description, category, content_category: contentCategory } = req.body;
     const tags = (req.body.tags || '').split(',').map((t) => t.trim()).filter(Boolean);
     const isFlare = req.body.is_flare === true || req.body.is_flare === 'true';
 
@@ -1807,11 +1673,11 @@ router.post('/upload/video',
       // is used regardless of what the frontend's optional thumbnail field sends.
       const { rows } = await db.query(`
         INSERT INTO videos
-          (creator_id, title, description, category, tags, cloudflare_video_id, thumbnail_url, duration_seconds, is_flare)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          (creator_id, title, description, category, content_category, tags, cloudflare_video_id, thumbnail_url, duration_seconds, is_flare)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING *
       `, [
-        req.user.id, title, description || null, category, tags,
+        req.user.id, title, description || null, category, contentCategory, tags,
         cf.uid, cf.thumbnail || null, durationSeconds, isFlare,
       ]);
 
@@ -2255,23 +2121,143 @@ router.patch('/channel/update',
   }
 );
 
+// ============================================================
+//  FLARES RANKING
+//
+//  Deliberately independent from the main feed's computeFeedScore/
+//  buildRankedFeed above — no shared scoring function, no
+//  cross-contamination between the two. Flares optimizes for immersive
+//  session length (completion/loop/swipe-away behavior dominates the
+//  score); the main feed optimizes for satisfaction/discovery with
+//  protected category placement. Different products, different goals.
+// ============================================================
+
+// Short-form content ages faster than long-form — a shorter half-life
+// than the main feed's FEED_RECENCY_HALF_LIFE_DAYS.
+const FLARE_RECENCY_HALF_LIFE_DAYS = 3;
+
+// Lighter weight on likes/comments/tips than the main feed on purpose —
+// completion/loop/swipe-away behavior dominates for this format, matching
+// how short-form ranking actually works in practice.
+const FLARE_WEIGHTS = {
+  COMPLETION:          60,
+  LOOP_RATE:           45, // rewatches are a strong positive signal
+  SWIPE_AWAY_PENALTY:  50, // inverse penalty
+  LIKES:                4,
+  COMMENTS:             3,
+  TIPS:                 8,
+  RECENCY:              8,
+};
+
+// A light touch, not the main feed's guaranteed category floor — Flares
+// is meant to feel effortless, not curated-for-balance. ~15% of each
+// page is nudged toward categories/creators not already present among
+// that page's top-scored picks.
+const FLARE_EXPLORATION_RATIO = 0.15;
+
+function computeFlareScore(flare) {
+  const completion    = clamp01((flare.avg_completion_pct ?? 0) / 100);
+  const loopRate      = clamp01(flare.loop_rate ?? 0);
+  const swipeAwayRate = clamp01(flare.swipe_away_rate ?? 0);
+
+  const likesScore    = Math.log10(1 + (flare.like_count ?? 0));
+  const commentsScore = Math.log10(1 + (flare.comment_count ?? 0));
+  const tipsScore      = Math.log10(1 + (flare.tips_received ?? 0));
+
+  const ageDays = Math.max(0, (Date.now() - new Date(flare.created_at).getTime()) / 86400000);
+  const recency = Math.pow(0.5, ageDays / FLARE_RECENCY_HALF_LIFE_DAYS);
+
+  return (
+    completion * FLARE_WEIGHTS.COMPLETION +
+    loopRate * FLARE_WEIGHTS.LOOP_RATE -
+    swipeAwayRate * FLARE_WEIGHTS.SWIPE_AWAY_PENALTY +
+    likesScore * FLARE_WEIGHTS.LIKES +
+    commentsScore * FLARE_WEIGHTS.COMMENTS +
+    tipsScore * FLARE_WEIGHTS.TIPS +
+    recency * FLARE_WEIGHTS.RECENCY
+  );
+}
+
+/**
+ * assembleFlaresPage
+ * Fills most of the page purely by score, then swaps a small
+ * exploration share in from candidates whose category AND creator both
+ * differ from what's already chosen — "outside the demonstrated
+ * pattern" in the lightest sense that's actually computable from a
+ * single page's candidates, no separate viewer-history lookup needed.
+ * Tops up with next-best-scored candidates if the pool is too small/
+ * homogeneous to find enough genuinely different picks.
+ */
+function assembleFlaresPage(scoredCandidates, limit) {
+  const sorted = [...scoredCandidates].sort((a, b) => b._score - a._score);
+  const explorationCount = Math.round(limit * FLARE_EXPLORATION_RATIO);
+  const scoreCount = Math.max(0, limit - explorationCount);
+
+  const chosen = sorted.slice(0, scoreCount);
+  const chosenIds = new Set(chosen.map((c) => c.id));
+  const chosenCategories = new Set(chosen.map((c) => c.content_category));
+  const chosenCreators = new Set(chosen.map((c) => c.creator_id));
+
+  const explorationPicks = [];
+  for (const c of sorted) {
+    if (explorationPicks.length >= explorationCount) break;
+    if (chosenIds.has(c.id)) continue;
+    if (chosenCategories.has(c.content_category) && chosenCreators.has(c.creator_id)) continue;
+    explorationPicks.push(c);
+    chosenIds.add(c.id);
+  }
+  for (const c of sorted) {
+    if (chosen.length + explorationPicks.length >= limit) break;
+    if (chosenIds.has(c.id)) continue;
+    explorationPicks.push(c);
+    chosenIds.add(c.id);
+  }
+
+  return [...chosen, ...explorationPicks].sort((a, b) => b._score - a._score);
+}
+
+/**
+ * buildRankedFlaresFeed
+ * Same round-based "assemble a page at a time, slice the offset window"
+ * shape as the main feed's buildRankedFeed, but a fully separate
+ * implementation — no shared code path between the two ranking systems.
+ */
+function buildRankedFlaresFeed(candidates, offset, limit) {
+  const scored = candidates.map((v) => ({ ...v, _score: computeFlareScore(v) }));
+  const remaining = [...scored];
+  const assembled = [];
+
+  while (assembled.length < offset + limit && remaining.length > 0) {
+    const round = assembleFlaresPage(remaining, Math.min(limit, remaining.length));
+    if (round.length === 0) break;
+    assembled.push(...round);
+    const roundIds = new Set(round.map((r) => r.id));
+    for (let i = remaining.length - 1; i >= 0; i--) {
+      if (roundIds.has(remaining[i].id)) remaining.splice(i, 1);
+    }
+  }
+
+  return assembled.slice(offset, offset + limit);
+}
+
+// Same reasoning as FEED_CANDIDATE_POOL_SIZE above — pre-launch catalog
+// size makes in-memory scoring simple and fast; revisit at scale.
+const FLARE_CANDIDATE_POOL_SIZE = 300;
+
 // ── GET /api/flares/feed ──────────────────────────────────────
 // Paginated feed for the vertical Flares experience (/flares) — a
 // TikTok-style short-form swipe feed, completely separate from the
 // long-form browse grid. Flares live in the same `videos` table as
 // long-form uploads (is_flare just flags which feed a row belongs to)
 // and share the exact same like/comment/tip/subscribe backend; this
-// route only returns the list.
+// route returns the ranked list.
 //
-// No ranking algorithm yet — "hot" score is views-per-hour-since-posted,
-// the standard simple blend of recency + popularity (a brand-new Flare
-// only needs a few views to rank; an old one needs sustained views to
-// stay near the top). Deliberately NOT true keyset/cursor pagination:
-// a computed, time-decaying score isn't a stable sort key to page
-// against (it changes underneath you as time passes), so this uses an
-// offset encoded as an opaque base64 "cursor" instead — correct and
-// standard for score-ranked feeds (this is how Reddit/HN-style "hot"
-// pagination works), just not literal keyset pagination.
+// Deliberately NOT true keyset/cursor pagination: computeFlareScore
+// isn't a stable sort key to page against (it changes as new
+// flare_swipe_events land), so this uses an offset encoded as an opaque
+// base64 "cursor" instead — correct and standard for score-ranked feeds
+// (this is how Reddit/HN-style "hot" pagination works), just not
+// literal keyset pagination.
 //
 // "Already seen this session" exclusion is caller-driven rather than
 // server-persisted: the client keeps a capped list of recently-seen
@@ -2305,21 +2291,40 @@ router.get('/flares/feed',
       const { rows } = await db.query(`
         SELECT v.id, v.title, v.description, v.cloudflare_video_id, v.thumbnail_url,
                v.duration_seconds, v.view_count, v.like_count, v.comment_count,
-               v.category, v.tags, v.created_at,
-               u.id AS creator_id, u.username AS creator_username,
+               v.category, v.content_category, v.tags, v.created_at, v.creator_id,
+               u.username AS creator_username,
                u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
-               COALESCE(u.follower_count, 0) AS creator_follower_count
+               COALESCE(u.follower_count, 0) AS creator_follower_count,
+               COALESCE(fe.avg_completion_pct, 0) AS avg_completion_pct,
+               COALESCE(fe.loop_rate, 0) AS loop_rate,
+               COALESCE(fe.swipe_away_rate, 0) AS swipe_away_rate,
+               COALESCE(t.tips_received, 0) AS tips_received
         FROM videos v
         JOIN users u ON u.id = v.creator_id
+        LEFT JOIN (
+          SELECT video_id,
+                 AVG(LEAST(100, (watched_seconds::float / NULLIF(video_duration_seconds, 0)) * 100)) AS avg_completion_pct,
+                 AVG(CASE WHEN looped THEN 1 ELSE 0 END) AS loop_rate,
+                 AVG(CASE WHEN swiped_away THEN 1 ELSE 0 END) AS swipe_away_rate
+          FROM flare_swipe_events
+          GROUP BY video_id
+        ) fe ON fe.video_id = v.id
+        LEFT JOIN (
+          SELECT content_id, SUM(amount_suns) AS tips_received
+          FROM tips
+          WHERE content_id IS NOT NULL
+          GROUP BY content_id
+        ) t ON t.content_id = v.id
         WHERE v.status = 'published' AND v.is_flare = true
-          AND ($3::uuid[] IS NULL OR NOT (v.id = ANY($3::uuid[])))
-        ORDER BY (v.view_count::float / GREATEST(EXTRACT(EPOCH FROM (NOW() - v.created_at)) / 3600.0, 1.0)) DESC,
-                 v.created_at DESC
-        LIMIT $1 OFFSET $2
-      `, [limit + 1, offset, excludeIds.length ? excludeIds : null]);
+          AND ($2::uuid[] IS NULL OR NOT (v.id = ANY($2::uuid[])))
+        ORDER BY v.created_at DESC
+        LIMIT $1
+      `, [FLARE_CANDIDATE_POOL_SIZE, excludeIds.length ? excludeIds : null]);
 
-      const hasMore = rows.length > limit;
-      const page = rows.slice(0, limit).map((r) => ({
+      const page = buildRankedFlaresFeed(rows, offset, limit);
+      const hasMore = offset + limit < rows.length;
+
+      const mapped = page.map((r) => ({
         id: r.id, title: r.title, description: r.description,
         cloudflare_video_id: r.cloudflare_video_id, thumbnail_url: r.thumbnail_url,
         duration_seconds: r.duration_seconds, view_count: r.view_count,
@@ -2335,10 +2340,47 @@ router.get('/flares/feed',
         ? Buffer.from(String(offset + limit), 'utf-8').toString('base64')
         : null;
 
-      res.json({ success: true, flares: page, nextCursor });
+      res.json({ success: true, flares: mapped, nextCursor });
     } catch (err) {
       console.error('flares feed error:', err.message);
       res.status(500).json({ error: 'Could not fetch Flares feed' });
+    }
+  }
+);
+
+// ── POST /api/flares/swipe-event ────────────────────────────────
+// Records one flare_swipe_events row — fired by the client on
+// swipe-away (leaving before 75% watched), loop detection (the player
+// looped back to 0 and kept playing while still the active slide), and
+// periodically during playback (same "every 10-15s" cadence as the main
+// feed's watch-progress ping). Anonymous viewers still contribute
+// signal — optionalAuth, not requireAuth.
+router.post('/flares/swipe-event',
+  optionalAuth,
+  [
+    body('videoId').isUUID().withMessage('Invalid video ID'),
+    body('watchedSeconds').isInt({ min: 0 }).withMessage('Invalid watched seconds'),
+    body('videoDurationSeconds').isInt({ min: 1 }).withMessage('Invalid video duration'),
+    body('swipedAway').optional().isBoolean(),
+    body('looped').optional().isBoolean(),
+  ],
+  validate,
+  async (req, res) => {
+    const { videoId, watchedSeconds, videoDurationSeconds } = req.body;
+    const swipedAway = req.body.swipedAway === true || req.body.swipedAway === 'true';
+    const looped = req.body.looped === true || req.body.looped === 'true';
+
+    try {
+      await db.query(`
+        INSERT INTO flare_swipe_events
+          (video_id, user_id, watched_seconds, video_duration_seconds, swiped_away, looped)
+        VALUES ($1, $2, $3, $4, $5, $6)
+      `, [videoId, req.user?.id || null, watchedSeconds, videoDurationSeconds, swipedAway, looped]);
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error('flares swipe-event error:', err.message);
+      res.status(500).json({ error: 'Could not record swipe event' });
     }
   }
 );
@@ -2373,7 +2415,8 @@ router.get('/video/:id',
 
       const video = {
         id: row.id, creator_id: row.creator_id, title: row.title, description: row.description,
-        category: row.category, tags: row.tags, cloudflare_video_id: row.cloudflare_video_id,
+        category: row.category, content_category: row.content_category, tags: row.tags,
+        cloudflare_video_id: row.cloudflare_video_id,
         thumbnail_url: row.thumbnail_url, duration_seconds: row.duration_seconds,
         status: row.status, view_count: row.view_count, created_at: row.created_at,
         like_count: row.like_count ?? 0, comment_count: row.comment_count ?? 0,

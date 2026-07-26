@@ -190,6 +190,51 @@ npm run dev            # node --watch server.js
   role='creator' (requireCreator, mounted before multer so non-creators never
   stream bytes).
 
+## Main Feed Ranking
+- `GET /api/feed?limit=&offset=` — optionalAuth, replaces the old `GET
+  /feed/recommended` "Discovery Engine", which was dead code referencing tables
+  (`vertical_content`, `landscape_content`, `content_views`, `user_interests`) and a
+  function (`upsert_user_interest`) that don't exist against the real schema — that
+  predates the current single `videos` table design and was never reconciled with
+  it, which is why it 500'd with "Could not generate recommended feed" and why
+  `POST /feed/view-complete` silently failed on every call. Both routes, and
+  `GET /feed/user-interests` (unused by any frontend page), were removed outright
+  rather than fixed in place
+- `computeFeedScore(video, viewer)` combines, per video: completion rate (avg of
+  `watch_events.completion_pct` — highest weight), `tips_received` (SUM of
+  `tips.amount_suns` by `content_id` — highest of the engagement-only signals),
+  comments, likes, view count, a gentle recency decay (long half-life — long-form
+  ages well), and a small additive country-match boost (`users.preferred_country`
+  vs. the creator's `country_code`, never a filter). See `FEED_WEIGHTS` in
+  zuva-api.js for exact coefficients
+- **Documentary & Discussion umbrella** — `documentary`, `discussion_debate`,
+  `interview`, `lifestyle_culture` from `content_category`. A code-level grouping
+  only (`DOC_DISCUSSION_CATEGORIES`), not a DB concept. Gets completion weighted
+  even more heavily and view count de-emphasized in `computeFeedScore`, plus a
+  guaranteed ~1-in-8 floor per page in `buildRankedFeed`/`assembleFeedRound` (a
+  further ~1-in-6 slice is reserved for general category diversity so no single
+  category — Documentary & Discussion or otherwise — can dominate a page)
+- Feed assembly happens in application memory over a capped candidate pool
+  (`FEED_CANDIDATE_POOL_SIZE = 500`, most recent published non-Flare videos) —
+  fine for this catalog size pre-launch; revisit (push scoring into SQL, or
+  paginate the candidate fetch) once the catalog is large enough that this stops
+  being cheap
+- **Known gap**: no per-video or per-creator language field exists anywhere in the
+  schema yet (captions live only in Cloudflare Stream, not our DB), so the
+  "language" half of the country/language boost is a documented no-op —
+  `users.preferred_languages` is stored but nothing reads it yet. Only the country
+  half is live
+- `POST /api/feed/watch-progress` — optionalAuth, writes one `watch_events` row per
+  call. Fired by the client every 10-15s during playback plus on pause/unload —
+  this granular signal is what `computeFeedScore`'s completion rate depends on;
+  there is no separate "on-leave" completion event like the old `view-complete`
+  route had
+- `videos.content_category` is a **separate column from the older `category`**
+  (`VALID_VIDEO_CATEGORIES` — Comedy/Drama/Music/News/Sports/Lifestyle/Education/
+  Other), which stays as-is and is still used for admin/related-videos. Two
+  category-like fields now coexist on `videos` — reconcile eventually, not done
+  as part of this task
+
 ## Flares (short-form vertical feed)
 - Same `videos` table/Cloudflare Stream pipeline as long-form uploads — `is_flare`
   boolean flags which feed a row belongs to; the main `/feed` browse grid and
@@ -199,14 +244,35 @@ npm run dev            # node --watch server.js
   Cloudflare video + rejects with 400), and again in `GET /upload/status/:videoId`
   once Cloudflare reports it asynchronously (flips `status` to `'rejected'`,
   response includes `flare_rejected: true`)
-- `GET /api/flares/feed?cursor=&limit=&exclude=` — optionalAuth, ranks by a simple
-  views-per-hour-since-posted "hot" score (no ranking algorithm yet, this is the
-  documented simple fallback). `cursor` is an opaque base64-encoded offset, not
-  true keyset pagination — a time-decaying score isn't a stable sort key to page
-  against, so this is the standard approach for score-ranked feeds. `exclude` is a
-  client-supplied comma-separated list of already-seen video IDs (capped at 200) —
-  session tracking is caller-driven, not server-persisted, so it works for
-  anonymous viewers too
+- `GET /api/flares/feed?cursor=&limit=&exclude=` — optionalAuth, now ranked by
+  `computeFlareScore(flare)`: primarily completion/watch-through rate, loop rate
+  (`flare_swipe_events.looped` — rewatches are a strong positive signal), and an
+  inverse penalty for swipe-away rate (`swiped_away`, true if the viewer left
+  before 75% watched). Likes/comments/tips carry much lighter weight than the main
+  feed — completion behavior dominates for short-form, on purpose. See
+  `FLARE_WEIGHTS` in zuva-api.js
+- **Deliberately independent from the main feed's scoring** — no shared scoring
+  function, `computeFlareScore`/`buildRankedFlaresFeed`/`assembleFlaresPage` never
+  call into `computeFeedScore`/`buildRankedFeed`/`assembleFeedRound` or vice versa.
+  Flares optimizes for immersive session length; the main feed optimizes for
+  satisfaction/discovery with protected category placement — different products,
+  different goals, per an explicit design decision
+- Light exploration mix-in (`FLARE_EXPLORATION_RATIO = 0.15`) — a softer touch than
+  the main feed's guaranteed category floor: ~15% of each page is nudged toward
+  candidates whose category AND creator both differ from what's already
+  score-picked, so the swipe feed doesn't fully lock a viewer into one narrow loop.
+  Falls back to next-best-scored candidates if the pool is too small/homogeneous
+  to find enough genuinely different picks
+- `cursor` is an opaque base64-encoded offset, not true keyset pagination — a
+  score that shifts as new `flare_swipe_events` land isn't a stable sort key to
+  page against, so this is the standard approach for score-ranked feeds (same as
+  Reddit/HN-style "hot" pagination). `exclude` is a client-supplied comma-separated
+  list of already-seen video IDs (capped at 200) — session tracking is
+  caller-driven, not server-persisted, so it works for anonymous viewers too
+- `POST /api/flares/swipe-event` — optionalAuth, writes one `flare_swipe_events`
+  row per call. Fired by the client on swipe-away, loop detection, and
+  periodically during playback (same cadence as the main feed's watch-progress
+  ping)
 - Likes/comments/tips/subscriptions are the exact same endpoints long-form videos
   use — nothing Flare-specific there
 

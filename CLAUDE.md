@@ -162,6 +162,25 @@ cp .env.example .env   # fill in values
 npm run dev            # node --watch server.js
 ```
 
+## Creator Application Lifecycle
+- `unconfirmed` → (emailed confirm link, `GET /api/creator-signup/confirm/:token`,
+  renders a branded HTML page) → `pending` → admin approve/reject
+- Approval (PATCH /api/admin/applications/:id) is transactional: matches the users
+  row by LOWER(email) → sets role='creator' (admins keep role) + links
+  `approved_user_id`; no user yet → `awaiting_signup=TRUE` and the role is applied
+  automatically at first sign-in (see below). Applicants get on-brand
+  approval/rejection emails (amber `#f37b0d`, vantablack) via sendApplicantEmail
+  (never throws, same contract as sendAdminEmail).
+- **Self-healing user creation** (`ensureUser` in src/middleware/requireAuth.js):
+  nothing creates users rows from Clerk sign-ins, so a verified session with no
+  users row = first sign-in → row created from the Clerk API profile
+  (role='creator' if an approved application awaits that email, else 'viewer'),
+  then ensureWallet runs. Requires a UNIQUE index on users.clerk_user_id
+  (migration 2026-07-26-application-flow.sql).
+- Upload endpoints (`POST /api/upload/video`, `GET /api/upload/status/:id`) require
+  role='creator' (requireCreator, mounted before multer so non-creators never
+  stream bytes).
+
 ## Engagement Layer (likes / comments / subscriptions)
 - Tables: `video_likes`, `comments` (one-level replies via `parent_comment_id`; status
   visible/hidden/deleted), `subscriptions` — see `schema/migrations/2026-07-26-engagement.sql`

@@ -123,6 +123,48 @@ async function sendAdminEmail(subject, htmlBody) {
   }
 }
 
+// Send to an arbitrary recipient (applicants) — same never-throws
+// contract as sendAdminEmail: a broken mail setup must not break the
+// application/approval flow that triggered it.
+async function sendApplicantEmail(to, subject, htmlBody) {
+  if (!mailTransport) {
+    console.error(`[mail] Skipping applicant email "${subject}" — mail transport not configured.`);
+    return;
+  }
+  try {
+    await mailTransport.sendMail({ from: process.env.GMAIL_USER, to, subject, html: htmlBody });
+  } catch (err) {
+    console.error(`[mail] Failed to send applicant email "${subject}" to ${to}:`, err.message);
+  }
+}
+
+// On-brand applicant email shell: vantablack background, amber accent,
+// table layout for email-client compatibility. All interpolated user
+// content must be escapeHtml()'d by the caller.
+function brandedEmailHtml({ heading, paragraphs, ctaText, ctaUrl }) {
+  const cta = ctaText && ctaUrl
+    ? `<tr><td style="padding:14px 0 6px;">
+         <a href="${ctaUrl}" style="display:inline-block;background:#f37b0d;color:#000000;font-weight:bold;font-size:14px;text-decoration:none;padding:13px 30px;border-radius:10px;">${ctaText}</a>
+       </td></tr>`
+    : '';
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#000000;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#000000;padding:36px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+             style="max-width:520px;background:#0d0d0d;border:1px solid rgba(243,123,13,0.3);border-radius:16px;padding:36px 32px;font-family:Arial,Helvetica,sans-serif;text-align:left;">
+        <tr><td style="color:#f37b0d;font-size:22px;font-weight:bold;padding-bottom:6px;">Zuva.tv ☀️</td></tr>
+        <tr><td style="color:#ffffff;font-size:19px;font-weight:bold;padding-bottom:14px;">${heading}</td></tr>
+        ${paragraphs.map((p) => `<tr><td style="color:#b3b3b3;font-size:14px;line-height:1.65;padding-bottom:12px;">${p}</td></tr>`).join('')}
+        ${cta}
+        <tr><td style="color:#555555;font-size:11px;line-height:1.5;padding-top:22px;border-top:1px solid rgba(255,255,255,0.06);">
+          Zuva.tv — African &amp; Caribbean streaming, powered by the Suns economy.<br/>
+          If this email wasn't meant for you, you can safely ignore it.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table></body></html>`;
+}
+
 // Minimal HTML escaping for user-supplied strings (video title, creator
 // name) interpolated into email bodies below.
 function escapeHtml(str) {
@@ -1464,22 +1506,104 @@ router.post('/creator-signup',
     }
 
     try {
-      // Applications are auto-approved on submission (no manual review step) —
-      // the admin Applications tab still lists every application and can
-      // reject/re-approve after the fact.
-      await db.query(`
+      // Lifecycle: 'unconfirmed' → (emailed confirm link) → 'pending' →
+      // (admin review) → 'approved' | 'rejected'. The confirmation_token
+      // column default (gen_random_uuid) mints the token.
+      const { rows } = await db.query(`
         INSERT INTO creator_applications
           (full_name, email, country, primary_platform, social_handle, content_category, follower_count, marketing_consent, status, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'approved', NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'unconfirmed', NOW())
+        RETURNING confirmation_token
       `, [
         fullName, email, country, primaryPlatform, socialHandle,
         contentCategory, followerCount, Boolean(marketingConsent),
       ]);
 
-      res.status(201).json({ success: true });
+      // Confirm link goes through the frontend domain — Next's /api/*
+      // rewrite proxies it to this backend, keeping zuva.tv in the email.
+      const appUrl = process.env.APP_URL || 'https://zuva.tv';
+      const confirmUrl = `${appUrl}/api/creator-signup/confirm/${rows[0].confirmation_token}`;
+      const firstName = escapeHtml(fullName.split(' ')[0]);
+
+      await sendApplicantEmail(
+        email,
+        'Confirm your Zuva creator application',
+        brandedEmailHtml({
+          heading: `One more step, ${firstName}!`,
+          paragraphs: [
+            `Thanks for applying to become a creator on <strong style="color:#f37b0d;">Zuva.tv</strong>.`,
+            `Tap the button below to confirm your application — once confirmed, our team will review it and get back to you by email.`,
+          ],
+          ctaText: 'Confirm My Application',
+          ctaUrl: confirmUrl,
+        })
+      );
+
+      res.status(201).json({
+        success: true,
+        message: 'Check your email to confirm your application.',
+      });
     } catch (err) {
       console.error('creator signup error:', err.message);
       res.status(500).json({ error: 'Could not submit application' });
+    }
+  }
+);
+
+
+// ============================================================
+//  ROUTE: GET /api/creator-signup/confirm/:token
+//  The emailed confirmation link. Flips 'unconfirmed' → 'pending' and
+//  renders a tiny branded HTML page (this is a browser navigation, not
+//  an API call). Used tokens / unknown tokens get a friendly page too.
+// ============================================================
+function confirmPageHtml(title, message) {
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title} — Zuva.tv</title></head>
+  <body style="margin:0;background:#000000;font-family:Arial,Helvetica,sans-serif;">
+    <div style="max-width:460px;margin:14vh auto 0;padding:40px 32px;background:#0d0d0d;border:1px solid rgba(243,123,13,0.3);border-radius:16px;text-align:center;">
+      <div style="color:#f37b0d;font-size:24px;font-weight:bold;margin-bottom:10px;">Zuva.tv ☀️</div>
+      <div style="color:#ffffff;font-size:19px;font-weight:bold;margin-bottom:12px;">${title}</div>
+      <div style="color:#b3b3b3;font-size:14px;line-height:1.6;margin-bottom:24px;">${message}</div>
+      <a href="${process.env.APP_URL || 'https://zuva.tv'}" style="display:inline-block;background:#f37b0d;color:#000;font-weight:bold;font-size:14px;text-decoration:none;padding:12px 28px;border-radius:10px;">Back to Zuva</a>
+    </div>
+  </body></html>`;
+}
+
+router.get('/creator-signup/confirm/:token',
+  [param('token').isUUID().withMessage('Invalid confirmation link')],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        UPDATE creator_applications
+        SET status = 'pending', confirmed_at = NOW()
+        WHERE confirmation_token = $1 AND status = 'unconfirmed'
+        RETURNING full_name, email
+      `, [req.params.token]);
+
+      if (!rows.length) {
+        return res.status(404).send(confirmPageHtml(
+          'Link expired or already used',
+          'This confirmation link is no longer valid. If you already confirmed, there is nothing more to do — our team is reviewing your application.'
+        ));
+      }
+
+      // Heads-up to the admin that a confirmed application awaits review.
+      sendAdminEmail(
+        'New creator application ready for review',
+        `<p><strong>${escapeHtml(rows[0].full_name)}</strong> (${escapeHtml(rows[0].email)}) confirmed their creator application. Review it in the admin dashboard.</p>`
+      );
+
+      res.send(confirmPageHtml(
+        'Application confirmed!',
+        `Thanks, ${escapeHtml(rows[0].full_name.split(' ')[0])} — your application is now with our review team. We'll email you as soon as there's a decision.`
+      ));
+    } catch (err) {
+      console.error('application confirm error:', err.message);
+      res.status(500).send(confirmPageHtml(
+        'Something went wrong',
+        'We could not confirm your application just now. Please try the link again in a few minutes.'
+      ));
     }
   }
 );
@@ -1575,6 +1699,9 @@ async function moderateVideo(cloudflareVideoId) {
 // than trusted, so a caller can't upload as someone else.
 router.post('/upload/video',
   requireClerkUser,
+  // Role gate BEFORE multer — a non-creator gets a clear 403 without the
+  // server ever accepting (up to 2GB of) upload bytes from them.
+  requireCreator,
   videoUpload.single('video'),
   [
     body('title').trim().notEmpty().isLength({ max: 200 }).withMessage('Title is required (max 200 characters)'),
@@ -1667,6 +1794,8 @@ router.post('/upload/video',
 // thumbnail_url once available. Does not touch the moderation `status`
 // column — see the NOTE above this section.
 router.get('/upload/status/:videoId',
+  requireClerkUser,
+  requireCreator,
   [param('videoId').isUUID().withMessage('Invalid video ID')],
   validate,
   async (req, res) => {
@@ -2280,7 +2409,8 @@ router.get('/admin/applications', requireAdmin, async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT id, full_name, email, country, primary_platform, social_handle,
-             content_category, follower_count, status, created_at
+             content_category, follower_count, status, created_at,
+             awaiting_signup, approved_user_id, confirmed_at
       FROM creator_applications
       ORDER BY created_at DESC
     `);
@@ -2292,6 +2422,12 @@ router.get('/admin/applications', requireAdmin, async (req, res) => {
 });
 
 // ── PATCH /api/admin/applications/:id ────────────────────────
+// Approval actually makes the applicant a creator, atomically:
+//   • users row matched by email (case-insensitive) → role = 'creator'
+//     (admins keep their role) + application linked via approved_user_id
+//   • no users row yet → awaiting_signup = TRUE; the self-healing user
+//     creation in requireAuth applies the creator role at first sign-in
+// Applicants get an on-brand approval/rejection email after commit.
 router.patch('/admin/applications/:id',
   requireAdmin,
   [
@@ -2302,17 +2438,124 @@ router.patch('/admin/applications/:id',
   ],
   validate,
   async (req, res) => {
+    const targetStatus = req.body.status;
+    const client = await db.connect();
+    let application;
     try {
-      const { rows } = await db.query(
-        `UPDATE creator_applications SET status = $1 WHERE id = $2 RETURNING id, status`,
-        [req.body.status, req.params.id]
+      await client.query('BEGIN');
+
+      const { rows: apps } = await client.query(
+        `SELECT id, full_name, email, status FROM creator_applications WHERE id = $1 FOR UPDATE`,
+        [req.params.id]
       );
-      if (!rows.length) return res.status(404).json({ error: 'Application not found' });
-      res.json({ success: true, application: rows[0] });
+      if (!apps.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Application not found' });
+      }
+      application = apps[0];
+
+      if (targetStatus === 'approved') {
+        const { rows: users } = await client.query(
+          `SELECT id, role FROM users
+           WHERE LOWER(email) = LOWER($1) AND deleted_at IS NULL
+           ORDER BY created_at ASC
+           LIMIT 1`,
+          [application.email]
+        );
+
+        if (users.length) {
+          const user = users[0];
+          if (user.role !== 'creator' && user.role !== 'admin') {
+            await client.query(
+              `UPDATE users SET role = 'creator' WHERE id = $1`,
+              [user.id]
+            );
+          }
+          await client.query(
+            `UPDATE creator_applications
+             SET status = 'approved', approved_user_id = $1, awaiting_signup = FALSE
+             WHERE id = $2`,
+            [user.id, application.id]
+          );
+          application.approved_user_id = user.id;
+          application.awaiting_signup = false;
+        } else {
+          // Applicant hasn't signed in to zuva.tv yet — approval still
+          // lands; first sign-in picks it up (see ensureUser in requireAuth).
+          await client.query(
+            `UPDATE creator_applications
+             SET status = 'approved', approved_user_id = NULL, awaiting_signup = TRUE
+             WHERE id = $1`,
+            [application.id]
+          );
+          application.approved_user_id = null;
+          application.awaiting_signup = true;
+        }
+      } else {
+        await client.query(
+          `UPDATE creator_applications
+           SET status = 'rejected', awaiting_signup = FALSE
+           WHERE id = $1`,
+          [application.id]
+        );
+        application.awaiting_signup = false;
+      }
+
+      await client.query('COMMIT');
     } catch (err) {
+      await client.query('ROLLBACK');
       console.error('admin application update error:', err.message);
-      res.status(500).json({ error: 'Could not update application' });
+      return res.status(500).json({ error: 'Could not update application' });
+    } finally {
+      client.release();
     }
+
+    // ── Applicant email — after commit, never blocks the response ──
+    const appUrl = process.env.APP_URL || 'https://zuva.tv';
+    const firstName = escapeHtml(application.full_name.split(' ')[0]);
+    if (targetStatus === 'approved') {
+      sendApplicantEmail(
+        application.email,
+        "Welcome to Zuva — you're approved! ☀️",
+        brandedEmailHtml({
+          heading: `You're in, ${firstName}!`,
+          paragraphs: [
+            `Your creator application has been <strong style="color:#f37b0d;">approved</strong> — welcome to the Zuva creator family.`,
+            application.awaiting_signup
+              ? `Sign in at zuva.tv with this email address (${escapeHtml(application.email)}) and your creator access will be ready the moment you arrive.`
+              : `Your account has been upgraded — sign in and you'll find your channel and upload tools waiting.`,
+            `Upload your first video, grow your audience across Africa, the Caribbean, and the diaspora, and earn Suns from day one.`,
+          ],
+          ctaText: 'Sign In & Start Creating',
+          ctaUrl: `${appUrl}/sign-in`,
+        })
+      );
+    } else {
+      sendApplicantEmail(
+        application.email,
+        'An update on your Zuva creator application',
+        brandedEmailHtml({
+          heading: `Thank you for applying, ${firstName}`,
+          paragraphs: [
+            `After careful review, we aren't able to approve your creator application right now.`,
+            `This isn't a closed door — creators grow, and so do we. You're warmly invited to reapply in the future as your content and audience develop.`,
+            `In the meantime, you're always welcome on Zuva as a viewer — watch, tip, and support the creators you love.`,
+          ],
+          ctaText: 'Visit Zuva',
+          ctaUrl: appUrl,
+        })
+      );
+    }
+
+    res.json({
+      success: true,
+      application: {
+        id: application.id,
+        status: targetStatus,
+        approved_user_id: application.approved_user_id ?? null,
+        awaiting_signup: application.awaiting_signup ?? false,
+      },
+    });
   }
 );
 

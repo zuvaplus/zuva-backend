@@ -1,6 +1,10 @@
 'use strict';
 
-const { verifyToken } = require('@clerk/backend');
+const { verifyToken, createClerkClient } = require('@clerk/backend');
+
+// Used only by the self-healing user creation below to fetch the signer's
+// email/profile — the session JWT alone doesn't carry email claims.
+const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 
 module.exports = function createAuthMiddleware(pool) {
 
@@ -39,6 +43,108 @@ module.exports = function createAuthMiddleware(pool) {
       [userId]
     );
     return existing.rows[0]?.id ?? null;
+  }
+
+  /**
+   * ensureUser — self-healing user creation, same pattern as ensureWallet.
+   * Nothing creates users rows from Clerk sign-ins (no webhook, no signup
+   * hook — the only rows so far were inserted manually), so a verified
+   * Clerk session whose sub has no users row means: first sign-in. Create
+   * the row here, deriving identity from the Clerk API.
+   *
+   * Approved-application hook: if a creator application for this email is
+   * status='approved' with no linked user (the admin approved before the
+   * applicant ever signed in — awaiting_signup), the new row is born with
+   * role='creator' and the application gets linked. No manual re-approval.
+   *
+   * Returns the same shape as the requireAuth lookup (walletId null — the
+   * ensureWallet call right after fills it), or null when Clerk has no
+   * such user / no usable email.
+   */
+  async function ensureUser(clerkUserId) {
+    let clerkUser;
+    try {
+      clerkUser = await clerkClient.users.getUser(clerkUserId);
+    } catch (err) {
+      console.error(`[user] Clerk lookup failed for ${clerkUserId}:`, err.message);
+      return null;
+    }
+
+    const email =
+      clerkUser.primaryEmailAddress?.emailAddress ??
+      clerkUser.emailAddresses?.[0]?.emailAddress ??
+      null;
+    if (!email) return null;
+
+    const baseUsername =
+      (clerkUser.username || email.split('@')[0])
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, '')
+        .slice(0, 24) || 'zuvauser';
+    const displayName =
+      [clerkUser.firstName, clerkUser.lastName].filter(Boolean).join(' ') ||
+      clerkUser.username ||
+      email.split('@')[0];
+
+    // Approved application waiting for this email → born a creator.
+    const { rows: pendingApprovals } = await pool.query(
+      `SELECT id FROM creator_applications
+       WHERE LOWER(email) = LOWER($1) AND status = 'approved' AND approved_user_id IS NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [email]
+    );
+    const role = pendingApprovals.length ? 'creator' : 'viewer';
+
+    // Two attempts: bare username, then suffixed — in case users.username
+    // has a unique constraint and the name is taken. ON CONFLICT on
+    // clerk_user_id makes a concurrent first-request race a no-op.
+    let created = null;
+    for (const username of [baseUsername, `${baseUsername}${Math.floor(1000 + Math.random() * 9000)}`]) {
+      try {
+        const { rows } = await pool.query(
+          `INSERT INTO users (id, clerk_user_id, email, username, display_name, avatar_url, role, status)
+           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'active')
+           ON CONFLICT (clerk_user_id) DO NOTHING
+           RETURNING id, role, email, username, country_code AS "countryCode"`,
+          [clerkUserId, email, username, displayName, clerkUser.imageUrl ?? null, role]
+        );
+        created = rows[0] ?? null;
+        break;
+      } catch (err) {
+        if (err.code === '23505') continue; // username collision — retry suffixed
+        throw err;
+      }
+    }
+
+    if (!created) {
+      // Lost the ON CONFLICT race to a concurrent request — row exists now.
+      const { rows } = await pool.query(
+        `SELECT u.id, u.role, u.email, u.username, u.country_code AS "countryCode",
+                w.id AS "walletId"
+         FROM users u
+         LEFT JOIN wallets w ON w.user_id = u.id
+         WHERE u.clerk_user_id = $1 AND u.deleted_at IS NULL AND u.status = 'active'
+         LIMIT 1`,
+        [clerkUserId]
+      );
+      return rows[0] ?? null;
+    }
+
+    console.log(`[user] self-healed: created users row for ${email} (${clerkUserId}) role=${role}`);
+
+    if (pendingApprovals.length) {
+      await pool.query(
+        `UPDATE creator_applications
+         SET approved_user_id = $1, awaiting_signup = FALSE
+         WHERE id = $2 AND approved_user_id IS NULL`,
+        [created.id, pendingApprovals[0].id]
+      );
+      console.log(`[user] applied awaiting creator approval ${pendingApprovals[0].id} to ${email}`);
+    }
+
+    created.walletId = null; // ensureWallet (called by requireAuth) fills this
+    return created;
   }
 
   /**
@@ -91,11 +197,16 @@ module.exports = function createAuthMiddleware(pool) {
         [clerkUserId]
       );
 
-      if (result.rows.length === 0) {
+      let user = result.rows[0] ?? null;
+      if (!user) {
+        // First sign-in — no users row yet. Self-heal (see ensureUser).
+        user = await ensureUser(clerkUserId);
+      }
+      if (!user) {
         return res.status(401).json({ error: 'User not found' });
       }
 
-      req.user = result.rows[0];
+      req.user = user;
       req.clerkUserId = clerkUserId;
 
       // Self-heal missing wallets so no user can ever hit "Wallet not found"
@@ -157,8 +268,14 @@ module.exports = function createAuthMiddleware(pool) {
         [clerkUserId]
       );
 
-      if (result.rows.length > 0) {
-        req.user = result.rows[0];
+      let user = result.rows[0] ?? null;
+      if (!user) {
+        // Same self-healing as requireAuth — a signed-in viewer on an
+        // optional-auth route still gets their row created on first visit.
+        user = await ensureUser(clerkUserId);
+      }
+      if (user) {
+        req.user = user;
         req.clerkUserId = clerkUserId;
         if (!req.user.walletId) {
           req.user.walletId = await ensureWallet(req.user.id);

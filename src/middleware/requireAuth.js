@@ -27,6 +27,12 @@ module.exports = function createAuthMiddleware(pool) {
           secretKey: process.env.CLERK_SECRET_KEY,
         });
       } catch (err) {
+        // TEMPORARY DEBUG LOGGING — remove once the 401 root cause is confirmed.
+        console.error('verifyToken failed:', {
+          message: err?.message,
+          reason: err?.reason,
+          longMessage: err?.longMessage,
+        });
         return res.status(401).json({ error: 'Unauthorized' });
       }
 

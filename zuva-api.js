@@ -8,8 +8,8 @@
  *
  *  Required .env variables:
  *    DATABASE_URL=postgresql://user:pass@host:5432/zuva
- *    CHIMONEY_API_KEY=your_chimoney_key
- *    CHIMONEY_BASE_URL=https://api.chimoney.io/v0.2
+ *    FLUTTERWAVE_SECRET_KEY=...            (payouts — African corridors)
+ *    FLUTTERWAVE_WEBHOOK_SECRET_HASH=...
  *    PLATFORM_WALLET_ID=00000000-0000-0000-0000-000000000001
  *    JWT_SECRET=your_jwt_secret
  * ============================================================
@@ -62,15 +62,9 @@ db.query('SELECT 1')
   .then(() => console.log('[db] Connected to Postgres'))
   .catch((err) => console.error('[db] Failed to connect to Postgres:', err.message));
 
-// ─── Chimoney client ──────────────────────────────────────────
-const chimoney = axios.create({
-  baseURL: process.env.CHIMONEY_BASE_URL,
-  headers: {
-    'X-API-KEY': process.env.CHIMONEY_API_KEY,
-    'Content-Type': 'application/json',
-  },
-  timeout: 15000,
-});
+// ─── Payout providers (Flutterwave / Mukuru / WiPay / Wise) ────
+const PayoutRouter = require('./services/payouts/PayoutRouter');
+const { ProviderNotConfiguredError } = require('./services/payouts/PayoutProvider');
 
 // ─── Cloudflare Stream client ──────────────────────────────────
 if (!process.env.CLOUDFLARE_ACCOUNT_ID || !process.env.CLOUDFLARE_API_TOKEN) {
@@ -158,20 +152,11 @@ const videoUpload = multer({
 // ─── Constants ────────────────────────────────────────────────
 const SUNS_PER_USD        = 1000;  // 1000 Suns = $1.00 USD
 const PLATFORM_WALLET_ID  = process.env.PLATFORM_WALLET_ID;
-const MIN_CASHOUT_SUNS    = 10000; // minimum 10,000 Suns ($10) to cash out
 
-// ── Safety spread on outbound exchange rates ──────────────────
-// Applied to the Chimoney rate at the moment a creator clicks Cashout.
-// If the live rate is 1000 KES/USD, we use 990 KES/USD (1% less).
-// This 1% buffer absorbs rate movement between when the creator
-// confirms and when Chimoney actually clears the payment (minutes
-// to hours). The surplus accrues to the platform as FX hedging.
-// To adjust: change the multiplier (0.99 = 1%, 0.98 = 2%, etc.)
-// NEVER set above 1.0 — that would expose Zuva to rate loss.
-const EXCHANGE_RATE_SAFETY_SPREAD = 0.99;
-
-// Supported pay-in currencies and their live-to-USD rate fetch
-const SUPPORTED_FIAT_CURRENCIES = ['USD', 'GBP', 'CAD', 'AUD'];
+// Minimum cashout is corridor-dependent — see MIN_PAYOUT_USD in
+// services/payouts/PayoutRouter.js ($5 Flutterwave/Mukuru, $20 WiPay/Wise).
+// FX conversion happens provider-side: payouts are initiated in USD and the
+// provider settles in the creator's local currency at its own rate.
 
 // ─── Middleware: auth guard (real Clerk JWT verification) ───────
 // The actual middleware is created in server.js and stored on the app.
@@ -215,27 +200,6 @@ const validate = (req, res, next) => {
 
 
 // ============================================================
-//  UTILITY: Fetch live exchange rate (fiat → USD)
-//  In production use a reliable provider: Open Exchange Rates,
-//  Wise API, or Chimoney's own rates endpoint.
-// ============================================================
-async function getFiatToUsdRate(currencyCode) {
-  if (currencyCode === 'USD') return 1.0;
-  try {
-    // Chimoney exposes an exchange rates endpoint
-    const resp = await chimoney.get('/info/exchange-rates');
-    const rates = resp.data?.data;
-    if (rates && rates[currencyCode]) {
-      return parseFloat(rates[currencyCode]);
-    }
-    throw new Error(`Rate not found for ${currencyCode}`);
-  } catch (err) {
-    throw new Error(`Could not fetch exchange rate for ${currencyCode}: ${err.message}`);
-  }
-}
-
-
-// ============================================================
 //  UTILITY: Execute a double-entry ledger transaction
 //
 //  This is the core financial function. It ALWAYS creates
@@ -249,8 +213,11 @@ async function getFiatToUsdRate(currencyCode) {
 //    amountSuns     — amount to move
 //    type           — transaction_type enum value
 //    transactionRef — UUID linking the paired entries
-//    opts           — { contentId, relatedUserId, chimoneyRef, memo, rate }
+//    opts           — { contentId, relatedUserId, providerRef, memo, rate }
 // ============================================================
+// NOTE: the ledger_entries column is still named chimoney_payment_ref for
+// historical reasons — it now holds ANY payment provider's reference.
+// Renaming it is optional cleanup (needs a coordinated migration + deploy).
 async function writeDoubleEntry(client, {
   debitWalletId,
   creditWalletId,
@@ -259,7 +226,7 @@ async function writeDoubleEntry(client, {
   transactionRef,
   contentId        = null,
   relatedUserId    = null,
-  chimoneyRef      = null,
+  providerRef      = null,
   memo             = null,
   exchangeRate     = null,
 }) {
@@ -270,7 +237,7 @@ async function writeDoubleEntry(client, {
        content_id, related_user_id, chimoney_payment_ref, usd_exchange_rate, memo)
     VALUES ($1, 'debit', $2, $3, $4, $5, $6, $7, $8, $9)
   `, [debitWalletId, amountSuns, type, transactionRef,
-      contentId, relatedUserId, chimoneyRef, exchangeRate, memo]);
+      contentId, relatedUserId, providerRef, exchangeRate, memo]);
 
   // Insert CREDIT row (money arrives at creditWallet)
   await client.query(`
@@ -279,7 +246,7 @@ async function writeDoubleEntry(client, {
        content_id, related_user_id, chimoney_payment_ref, usd_exchange_rate, memo)
     VALUES ($1, 'credit', $2, $3, $4, $5, $6, $7, $8, $9)
   `, [creditWalletId, amountSuns, type, transactionRef,
-      contentId, relatedUserId, chimoneyRef, exchangeRate, memo]);
+      contentId, relatedUserId, providerRef, exchangeRate, memo]);
 
   // The update_wallet_balance() DB trigger fires after each INSERT
   // and recomputes both wallets' balances from the full ledger history.
@@ -316,201 +283,18 @@ router.get('/wallet/balance', requireAuth, async (req, res) => {
 
 
 // ============================================================
-//  ROUTE 2: POST /api/suns/purchase
-//  Diaspora user buys Suns with fiat currency.
-//
-//  Flow:
-//    1. Validate request
-//    2. Fetch live exchange rate (fiat → USD)
-//    3. Calculate Suns to issue (fiat × fiatToUsd × SUNS_PER_USD)
-//    4. Create a pending sun_purchase record
-//    5. Call Chimoney to create a payment checkout link
-//    6. Return the Chimoney checkout URL to the frontend
-//    7. Chimoney calls our webhook (/api/webhooks/chimoney) on payment success
-//    8. Webhook: write double-entry ledger, mark purchase complete
+//  ROUTE 2: POST /api/suns/purchase — TEMPORARILY DISABLED
+//  Chimoney (our pay-in provider) shut down in May 2026 and no
+//  replacement checkout provider has been selected yet. The route
+//  is kept so the frontend gets a clean, machine-readable 503
+//  instead of a 404; the sun_purchases table and its RLS policies
+//  are untouched, ready for the next provider.
 // ============================================================
-router.post('/suns/purchase',
-  requireAuth,
-  [
-    body('fiatAmount')
-      .isFloat({ min: 1.00 })
-      .withMessage('Minimum purchase is $1.00'),
-    body('fiatCurrency')
-      .isIn(SUPPORTED_FIAT_CURRENCIES)
-      .withMessage(`Currency must be one of: ${SUPPORTED_FIAT_CURRENCIES.join(', ')}`),
-  ],
-  validate,
-  async (req, res) => {
-    const { fiatAmount, fiatCurrency } = req.body;
-    const buyerId = req.user.id;
-
-    try {
-      // ── Step 1: Get live exchange rate ──────────────────────
-      const fiatToUsdRate = await getFiatToUsdRate(fiatCurrency);
-      const usdEquivalent = parseFloat(fiatAmount) * fiatToUsdRate;
-
-      // ── Step 2: Calculate Suns ──────────────────────────────
-      // Floor to nearest whole Sun (no fractional Suns in the ledger)
-      const sunsPurchased = Math.floor(usdEquivalent * SUNS_PER_USD);
-
-      if (sunsPurchased < 1000) {
-        return res.status(400).json({
-          error: 'Minimum purchase is equivalent to 1,000 Suns ($1.00 USD)',
-        });
-      }
-
-      // ── Step 3: Create pending purchase record ──────────────
-      const purchaseId = uuidv4();
-      await db.query(`
-        INSERT INTO sun_purchases
-          (id, buyer_id, fiat_amount, fiat_currency, suns_purchased, fiat_to_usd_rate)
-        VALUES ($1, $2, $3, $4, $5, $6)
-      `, [purchaseId, buyerId, fiatAmount, fiatCurrency, sunsPurchased, fiatToUsdRate]);
-
-      // ── Step 4: Call Chimoney to initiate payment ───────────
-      // Chimoney's payment/initiate creates a hosted checkout page.
-      // The user is redirected there to complete payment.
-      // Chimoney notifies us via webhook when payment clears.
-      const chimoneyPayload = {
-        valueInUSD:    usdEquivalent,
-        currency:      fiatCurrency,
-        amount:        parseFloat(fiatAmount),
-        paymentType:   'card',  // Chimoney supports card, bank, mobile money
-        redirect_url:  `${process.env.APP_URL}/purchase-success?id=${purchaseId}`,
-        meta: {
-          purchaseId,
-          buyerId,
-          sunsPurchased,
-          platform: 'zuva.tv',
-        },
-      };
-
-      const chimoneyResp = await chimoney.post('/payment/initiate', chimoneyPayload);
-      const { paymentLink, issueID } = chimoneyResp.data?.data || {};
-
-      if (!paymentLink) {
-        throw new Error('Chimoney did not return a payment link');
-      }
-
-      // ── Step 5: Update purchase record with Chimoney details ─
-      await db.query(`
-        UPDATE sun_purchases
-        SET chimoney_payment_id = $1, chimoney_checkout_url = $2, chimoney_response = $3
-        WHERE id = $4
-      `, [issueID, paymentLink, JSON.stringify(chimoneyResp.data), purchaseId]);
-
-      // Return checkout URL — frontend redirects user here
-      res.json({
-        success:        true,
-        purchaseId,
-        sunsPurchased,
-        fiatAmount:     parseFloat(fiatAmount),
-        fiatCurrency,
-        usdEquivalent:  usdEquivalent.toFixed(2),
-        checkoutUrl:    paymentLink,
-        message: `Pay ${fiatCurrency} ${fiatAmount} to receive ${sunsPurchased.toLocaleString()} Suns`,
-      });
-
-    } catch (err) {
-      console.error('sun purchase error:', err.response?.data || err.message);
-      res.status(500).json({ error: 'Purchase initiation failed. Please try again.' });
-    }
-  }
-);
-
-
-// ============================================================
-//  ROUTE 3: POST /api/webhooks/chimoney
-//  Chimoney calls this when a payment_initiate is completed.
-//  This is where Suns are actually credited to the user's wallet.
-//
-//  SECURITY: Verify Chimoney's webhook signature before processing.
-//  Chimoney sends an X-Chimoney-Signature header — validate it.
-// ============================================================
-router.post('/webhooks/chimoney', async (req, res) => {
-  const { issueID, status, meta } = req.body;
-
-  // TODO: Verify webhook signature
-  // const sig = req.headers['x-chimoney-signature'];
-  // if (!verifyChimoneySignature(sig, req.body)) return res.sendStatus(401);
-
-  if (status !== 'paid' && status !== 'success') {
-    // Chimoney sends webhooks for all status changes; ignore non-success ones
-    return res.sendStatus(200);
-  }
-
-  const { purchaseId, buyerId, sunsPurchased } = meta || {};
-  if (!purchaseId || !buyerId || !sunsPurchased) {
-    return res.status(400).json({ error: 'Invalid webhook payload' });
-  }
-
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-
-    // Check purchase hasn't already been processed (idempotency guard)
-    const { rows } = await client.query(
-      'SELECT status FROM sun_purchases WHERE id = $1 FOR UPDATE',
-      [purchaseId]
-    );
-    if (!rows.length || rows[0].status !== 'pending') {
-      await client.query('ROLLBACK');
-      return res.sendStatus(200); // already processed, return 200 so Chimoney stops retrying
-    }
-
-    // Get buyer's wallet ID
-    const walletRes = await client.query(
-      'SELECT id FROM wallets WHERE user_id = $1', [buyerId]
-    );
-    const buyerWalletId = walletRes.rows[0]?.id;
-    if (!buyerWalletId) throw new Error(`Wallet not found for user ${buyerId}`);
-
-    // Get platform wallet ID
-    const platformWalletRes = await client.query(
-      'SELECT id FROM wallets WHERE user_id = $1', [PLATFORM_WALLET_ID]
-    );
-    const platformWalletId = platformWalletRes.rows[0]?.id;
-
-    const transactionRef = uuidv4();
-
-    // ── Write double entry ─────────────────────────────────────
-    // DEBIT platform reserve (Suns are "created" from a platform reserve concept)
-    // CREDIT buyer's wallet
-    // Note: In a real system the "platform reserve" is a dedicated account
-    // representing the total Suns in circulation. We use the platform wallet.
-    await writeDoubleEntry(client, {
-      debitWalletId:  platformWalletId,
-      creditWalletId: buyerWalletId,
-      amountSuns:     parseInt(sunsPurchased),
-      type:           'sun_purchase',
-      transactionRef,
-      chimoneyRef:    issueID,
-      memo:           `Purchase of ${sunsPurchased} Suns via Chimoney`,
-    });
-
-    // Update purchase record
-    await client.query(`
-      UPDATE sun_purchases
-      SET status = 'completed', completed_at = NOW(), ledger_transaction_ref = $1
-      WHERE id = $2
-    `, [transactionRef, purchaseId]);
-
-    // Update wallet lifetime stats
-    await client.query(`
-      UPDATE wallets SET total_earned_suns = total_earned_suns + $1 WHERE id = $2
-    `, [sunsPurchased, buyerWalletId]);
-
-    await client.query('COMMIT');
-    console.log(`✓ ${sunsPurchased} Suns credited to user ${buyerId} (purchase ${purchaseId})`);
-    res.sendStatus(200);
-
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('webhook error:', err.message);
-    res.status(500).json({ error: 'Webhook processing failed' });
-  } finally {
-    client.release();
-  }
+router.post('/suns/purchase', requireAuth, (_req, res) => {
+  res.status(503).json({
+    error: 'Suns purchases are coming soon',
+    code:  'PURCHASES_NOT_LIVE',
+  });
 });
 
 
@@ -683,16 +467,21 @@ router.post('/suns/tip',
 
 // ============================================================
 //  ROUTE 5: POST /api/suns/cashout
-//  Creator cashes out their Suns balance to mobile money or bank.
+//  Creator cashes out their Suns balance. Provider-routed:
+//  services/payouts/PayoutRouter.js picks Flutterwave / Mukuru /
+//  WiPay / Wise from the creator's country code.
 //
 //  Flow:
-//    1. Validate request and check minimum cashout amount
-//    2. Verify creator's wallet has sufficient balance
-//    3. Fetch live USD → local currency exchange rate from Chimoney
-//    4. Calculate fiat payout amount (Suns ÷ 100 = USD, then to local)
-//    5. Debit creator wallet, credit platform payout record
-//    6. Call Chimoney payout API to send funds
-//    7. Update payout record with Chimoney's response
+//    1. Route + enforce the corridor's minimum (USD)
+//    2. Atomically debit the creator's Suns (double-entry inside one
+//       transaction; the wallets CHECK constraint makes an overdraft
+//       impossible) and insert the payout row as 'pending'
+//    3. Call the provider's initiatePayout with a fresh idempotency key
+//       (crypto.randomUUID — the uuid package breaks on Railway)
+//    4. Success → payout 'processing' + provider reference stored
+//       Failure → Suns re-credited atomically, payout 'failed'
+//    5. Provider webhook (/api/webhooks/payouts/:provider) finalizes:
+//       'completed', or 'failed' + re-credit
 //
 //  NOTE: The cashout amount is ALREADY the creator's post-commission balance.
 //  The commission was deducted at the time each tip was received.
@@ -703,11 +492,14 @@ router.post('/suns/cashout',
   requireCreator,
   [
     body('amountSuns')
-      .isInt({ min: MIN_CASHOUT_SUNS })
-      .withMessage(`Minimum cashout is ${MIN_CASHOUT_SUNS} Suns ($${MIN_CASHOUT_SUNS / SUNS_PER_USD} USD)`),
+      .isInt({ min: 1000 })
+      .withMessage('Cashout amount must be at least 1,000 Suns ($1 USD); regional minimums also apply'),
+    // Legacy network-suffixed channels are accepted and collapse to
+    // 'mobile_money' — the corridor (creator country) decides the network.
     body('channel')
-      .isIn(['mobile_money_mpesa','mobile_money_mtn','mobile_money_airtel',
-             'mobile_money_ecocash','bank_transfer','chimoney_wallet'])
+      .isIn(['mobile_money', 'bank_transfer', 'cash_pickup',
+             'mobile_money_mpesa', 'mobile_money_mtn', 'mobile_money_airtel',
+             'mobile_money_ecocash'])
       .withMessage('Invalid payout channel'),
     body('phoneNumber')
       .optional()
@@ -716,28 +508,62 @@ router.post('/suns/cashout',
     body('bankAccountRef')
       .optional()
       .isString(),
+    body('bankCode')
+      .optional()
+      .isString(),
+    // Legal name — payout partners require the recipient's real name for
+    // KYC/AML compliance; it must match the creator's government ID.
+    body('recipientFirstName')
+      .isString().trim().isLength({ min: 1, max: 100 })
+      .withMessage('Legal first name is required (max 100 characters)'),
+    body('recipientLastName')
+      .isString().trim().isLength({ min: 1, max: 100 })
+      .withMessage('Legal last name is required (max 100 characters)'),
+    // Kept for request-shape compatibility; the destination currency is
+    // now determined by the provider corridor, not the client.
     body('localCurrencyCode')
-      .isLength({ min: 3, max: 3 })
-      .withMessage('Provide a valid ISO 4217 currency code (e.g. KES, GHS, JMD)'),
+      .optional()
+      .isLength({ min: 3, max: 3 }),
   ],
   validate,
   async (req, res) => {
     const {
-      amountSuns,
-      channel,
-      phoneNumber,
-      bankAccountRef,
-      localCurrencyCode,
+      amountSuns, channel, phoneNumber, bankAccountRef, bankCode,
+      recipientFirstName, recipientLastName,
     } = req.body;
     const creatorId = req.user.id;
 
+    // ── Step 1: Route to a provider + enforce corridor minimum ──
+    const method    = channel.startsWith('mobile_money') ? 'mobile_money' : channel;
+    const usdAmount = amountSuns / SUNS_PER_USD;
+
+    let routeInfo;
+    try {
+      routeInfo = PayoutRouter.route({ countryCode: req.user.countryCode, method });
+      PayoutRouter.enforceMinimum(routeInfo, usdAmount);
+    } catch (err) {
+      if (err instanceof PayoutRouter.PayoutRoutingError) {
+        return res.status(400).json({ error: err.message });
+      }
+      throw err;
+    }
+
+    const idempotencyKey = uuidv4(); // crypto.randomUUID under the hood
+    const payoutId       = uuidv4();
+    const transactionRef = uuidv4();
+
+    // ── Step 2: Atomic debit + pending payout record ─────────────
+    // Everything money-related happens inside one transaction: the
+    // FOR UPDATE lock + CHECK (balance_suns >= 0) constraint guarantee
+    // the debit can never overdraw, and the payout row commits with the
+    // debit or not at all.
     const client = await db.connect();
+    let wallet;
     try {
       await client.query('BEGIN');
 
-      // ── Step 1: Lock and verify creator wallet balance ───────
       const walletRes = await client.query(`
-        SELECT w.id, w.balance_suns, cp.tier, cp.creator_share_pct, cp.platform_share_pct
+        SELECT w.id, w.balance_suns, cp.tier, cp.creator_share_pct
         FROM wallets w
         JOIN creator_profiles cp ON cp.user_id = w.user_id
         WHERE w.user_id = $1
@@ -748,8 +574,7 @@ router.post('/suns/cashout',
         await client.query('ROLLBACK');
         return res.status(404).json({ error: 'Creator wallet not found' });
       }
-
-      const wallet = walletRes.rows[0];
+      wallet = walletRes.rows[0];
 
       if (wallet.balance_suns < amountSuns) {
         await client.query('ROLLBACK');
@@ -760,78 +585,30 @@ router.post('/suns/cashout',
         });
       }
 
-      // ── Step 2: Calculate fiat payout amount ─────────────────
-      // amountSuns ÷ 100 = USD value
-      // USD × exchange_rate = local currency amount
-      const usdAmount = amountSuns / SUNS_PER_USD;
-
-      // Fetch live rate from Chimoney and apply 1% safety spread
-      // ── Why a safety spread? ────────────────────────────────────
-      // The rate we show the creator at click-time may shift before
-      // Chimoney actually clears the payment. The 1% buffer (EXCHANGE_RATE_SAFETY_SPREAD = 0.99)
-      // means Zuva pays out at 99% of the mid-market rate.
-      // Example: live rate = 1302.50 KES/USD
-      //   Effective rate    = 1302.50 × 0.99 = 1289.47 KES/USD
-      //   Creator receives  = usdAmount × 1289.47 KES
-      //   Platform retains  = usdAmount × 13.03 KES (the FX buffer)
-      // The buffer is logged per-payout and accrues to the platform wallet.
-      // NEVER set EXCHANGE_RATE_SAFETY_SPREAD above 1.0.
-      let rawExchangeRate  = 1.0;   // mid-market rate straight from Chimoney
-      let exchangeRate     = 1.0;   // rate applied after spread (this is what we pay out at)
-      let localAmount      = usdAmount;
-      let fxBufferAmount   = 0;     // local-currency units held as FX hedging buffer
-
-      if (localCurrencyCode !== 'USD') {
-        const ratesResp = await chimoney.get('/info/exchange-rates');
-        const rates     = ratesResp.data?.data;
-        if (!rates || !rates[localCurrencyCode]) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: `Unsupported payout currency: ${localCurrencyCode}` });
-        }
-
-        rawExchangeRate   = parseFloat(rates[localCurrencyCode]);
-        exchangeRate      = rawExchangeRate * EXCHANGE_RATE_SAFETY_SPREAD;
-
-        const rawLocal    = usdAmount * rawExchangeRate;
-        localAmount       = usdAmount * exchangeRate;
-        fxBufferAmount    = rawLocal - localAmount;
-
-        console.log(
-          `[FX:cashout] ${localCurrencyCode} ` +
-          `raw=${rawExchangeRate.toFixed(4)} ` +
-          `spread=${((1 - EXCHANGE_RATE_SAFETY_SPREAD) * 100).toFixed(1)}% ` +
-          `effective=${exchangeRate.toFixed(4)} ` +
-          `buffer=${fxBufferAmount.toFixed(2)} ${localCurrencyCode}`
-        );
-      }
-
-      // ── Step 3: Create payout record (before calling Chimoney) ─
-      const payoutId       = uuidv4();
-      const transactionRef = uuidv4();
-
       await client.query(`
         INSERT INTO payouts (
           id, creator_id, amount_suns, creator_suns, platform_suns,
           tier_at_payout, creator_pct_at_payout,
-          usd_amount, local_currency_code, local_currency_amount, exchange_rate,
+          usd_amount, local_currency_code,
           channel, payout_phone, payout_bank_ref,
-          status, ledger_transaction_ref
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'processing',$15)
+          status, ledger_transaction_ref,
+          provider, idempotency_key,
+          recipient_first_name, recipient_last_name
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',$13,$14,$15,$16,$17)
       `, [
         payoutId, creatorId,
         amountSuns,
         amountSuns,  // creator_suns = full amount (commission already deducted at tip time)
         0,           // platform_suns = 0 at cashout (already collected)
         wallet.tier, wallet.creator_share_pct,
-        usdAmount.toFixed(2), localCurrencyCode,
-        localAmount.toFixed(2), exchangeRate.toFixed(6),
-        channel, phoneNumber || null, bankAccountRef || null,
+        usdAmount.toFixed(2),
+        'USD',       // we initiate in USD; the provider settles in local currency
+        method, phoneNumber || null, bankAccountRef || null,
         transactionRef,
+        routeInfo.provider, idempotencyKey,
+        recipientFirstName, recipientLastName,
       ]);
 
-      // ── Step 4: Debit creator wallet ─────────────────────────
-      // We debit creator wallet → platform "outgoing" account.
-      // This records that the money has left the platform's custody.
       const platformWalletRes = await client.query(
         'SELECT id FROM wallets WHERE user_id = $1', [PLATFORM_WALLET_ID]
       );
@@ -843,100 +620,154 @@ router.post('/suns/cashout',
         amountSuns,
         type:           'creator_payout',
         transactionRef,
-        chimoneyRef:    null,  // filled in after Chimoney responds
-        exchangeRate,
-        memo: `Cashout: ${amountSuns} Suns → ${localAmount.toFixed(2)} ${localCurrencyCode} via ${channel}`,
+        providerRef:    idempotencyKey,
+        memo: `Cashout: ${amountSuns} Suns ($${usdAmount.toFixed(2)}) via ${routeInfo.provider} (${method})`,
       });
-
-      // ── Step 5: Call Chimoney payout API ─────────────────────
-      let chimoneyPayload;
-      let chimoneyEndpoint;
-
-      if (channel.startsWith('mobile_money')) {
-        // Map our channel to Chimoney's mobile money network name
-        const networkMap = {
-          mobile_money_mpesa:  'mpesa',
-          mobile_money_mtn:    'mtn',
-          mobile_money_airtel: 'airtel',
-          mobile_money_ecocash:'ecocash',
-        };
-        chimoneyEndpoint = '/payouts/mobile-money';
-        chimoneyPayload  = {
-          valueInUSD: usdAmount,
-          receiver: [{
-            phone:      phoneNumber,
-            network:    networkMap[channel],
-            countryCode: localCurrencyCode === 'KES' ? 'KE'
-                       : localCurrencyCode === 'GHS' ? 'GH'
-                       : localCurrencyCode === 'ZWL' ? 'ZW'
-                       : undefined,
-            valueInUSD: usdAmount,
-          }],
-          meta: { payoutId, creatorId, platform: 'zuva.tv' },
-        };
-      } else if (channel === 'bank_transfer') {
-        chimoneyEndpoint = '/payouts/bank';
-        chimoneyPayload  = {
-          valueInUSD: usdAmount,
-          receiver: [{
-            bankAccountNumber: bankAccountRef,
-            valueInUSD:        usdAmount,
-          }],
-          meta: { payoutId, creatorId, platform: 'zuva.tv' },
-        };
-      } else {
-        // chimoney_wallet — fastest, no conversion fee
-        chimoneyEndpoint = '/payouts/chimoney';
-        chimoneyPayload  = {
-          chimoneys: [{
-            email:      req.user.email,
-            valueInUSD: usdAmount,
-          }],
-          meta: { payoutId, creatorId, platform: 'zuva.tv' },
-        };
-      }
-
-      const chimoneyResp = await chimoney.post(chimoneyEndpoint, chimoneyPayload);
-      const issueID      = chimoneyResp.data?.data?.issueID;
-
-      // ── Step 6: Update payout with Chimoney response ─────────
-      await client.query(`
-        UPDATE payouts
-        SET status = 'processing', chimoney_issue_id = $1, chimoney_response = $2, processed_at = NOW()
-        WHERE id = $3
-      `, [issueID, JSON.stringify(chimoneyResp.data), payoutId]);
-
-      // Update creator wallet lifetime cashout stat
-      await client.query(`
-        UPDATE wallets SET total_cashed_out_suns = total_cashed_out_suns + $1 WHERE user_id = $2
-      `, [amountSuns, creatorId]);
 
       await client.query('COMMIT');
-
-      res.json({
-        success:        true,
-        payoutId,
-        transactionRef,
-        amountSuns,
-        usdAmount:      usdAmount.toFixed(2),
-        localAmount:    localAmount.toFixed(2),
-        localCurrency:  localCurrencyCode,
-        exchangeRate:   exchangeRate.toFixed(4),
-        channel,
-        chimoneyIssueId: issueID,
-        status:         'processing',
-        message: `${amountSuns} Suns (${localAmount.toFixed(2)} ${localCurrencyCode}) sent via Chimoney. Usually arrives within minutes.`,
-      });
-
     } catch (err) {
       await client.query('ROLLBACK');
-      console.error('cashout error:', err.response?.data || err.message);
-      res.status(500).json({ error: 'Cashout failed. Your balance has not been changed.' });
+      console.error('cashout debit error:', err.message);
+      return res.status(500).json({ error: 'Cashout failed. Your balance has not been changed.' });
     } finally {
       client.release();
     }
+
+    // ── Step 3: Initiate the payout with the provider ────────────
+    // The Suns are already debited; from here a failure must re-credit.
+    try {
+      const result = await routeInfo.adapter.initiatePayout({
+        creatorId,
+        amountUSD: usdAmount,
+        method,
+        recipientDetails: {
+          countryCode:       req.user.countryCode,
+          msisdn:            phoneNumber,            // must include country code
+          bankAccountNumber: bankAccountRef,
+          bankCode:          bankCode || null,
+          firstName:         recipientFirstName,     // legal name, collected at cashout
+          lastName:          recipientLastName,
+          email:             req.user.email,
+        },
+        idempotencyKey,
+      });
+
+      await db.query(`
+        UPDATE payouts
+        SET status = 'processing', provider_reference = $1, provider_response = $2,
+            processed_at = NOW()
+        WHERE id = $3
+      `, [result.providerReference, JSON.stringify(result.raw ?? null), payoutId]);
+
+      return res.json({
+        success:   true,
+        payoutId,
+        transactionRef,
+        amountSuns,
+        usdAmount: usdAmount.toFixed(2),
+        provider:  routeInfo.provider,
+        channel:   method,
+        status:    'processing',
+        message: `${amountSuns} Suns ($${usdAmount.toFixed(2)} USD) payout initiated via ${routeInfo.provider}. ` +
+                 `You'll receive it in your local currency once the provider confirms.`,
+      });
+    } catch (err) {
+      const notConfigured = err instanceof ProviderNotConfiguredError;
+      if (notConfigured) {
+        console.log(`cashout: ${routeInfo.provider} not configured — re-crediting ${amountSuns} Suns to ${creatorId}`);
+      } else {
+        console.error('cashout initiate error:', err.response?.data || err.message);
+      }
+
+      // ── Re-credit the Suns atomically and mark the payout failed ──
+      const revClient = await db.connect();
+      try {
+        await revClient.query('BEGIN');
+        const platformWalletRes = await revClient.query(
+          'SELECT id FROM wallets WHERE user_id = $1', [PLATFORM_WALLET_ID]
+        );
+        await writeDoubleEntry(revClient, {
+          debitWalletId:  platformWalletRes.rows[0]?.id,
+          creditWalletId: wallet.id,
+          amountSuns,
+          type:           'creator_payout',
+          transactionRef: uuidv4(),
+          providerRef:    idempotencyKey,
+          memo: `Payout ${payoutId} could not be initiated — Suns returned`,
+        });
+        await revClient.query(`
+          UPDATE payouts SET status = 'failed', processed_at = NOW() WHERE id = $1
+        `, [payoutId]);
+        await revClient.query('COMMIT');
+      } catch (revErr) {
+        await revClient.query('ROLLBACK');
+        // The payout row stays 'pending' with the debit applied — flag loudly
+        // for manual reconciliation rather than guessing.
+        console.error(`[CRITICAL] cashout ${payoutId}: initiate failed AND re-credit failed:`, revErr.message);
+        return res.status(500).json({
+          error: 'Cashout failed and could not be automatically reversed. Support has been notified — do not retry.',
+          payoutId,
+        });
+      } finally {
+        revClient.release();
+      }
+
+      // Provider not configured (pre-launch) is an expected state, not an
+      // upstream failure: structured 503 so the frontend can message it.
+      if (notConfigured) {
+        return res.status(503).json({
+          error: `${err.message} Your Suns have been returned to your balance.`,
+          code: 'PAYOUTS_NOT_CONFIGURED',
+        });
+      }
+
+      return res.status(502).json({
+        error: 'Cashout could not be initiated with the payout provider. Your Suns have been returned to your balance.',
+      });
+    }
   }
 );
+
+
+// ============================================================
+//  ROUTE: GET /api/payouts/options
+//  The authenticated creator's available cashout methods, routed
+//  from their country code. `configured: false` methods exist but
+//  can't move money yet (provider keys/onboarding pending) — the
+//  frontend shows them disabled with a "coming soon" badge.
+// ============================================================
+router.get('/payouts/options', requireAuth, requireCreator, (req, res) => {
+  const countryCode = req.user.countryCode ?? null;
+  res.json({
+    success: true,
+    countryCode,
+    methods: PayoutRouter.optionsForCountry(countryCode),
+  });
+});
+
+
+// ============================================================
+//  ROUTE: GET /api/payouts/history
+//  The authenticated creator's payouts, newest first. `failed`
+//  payouts had their Suns re-credited (initiation failure or
+//  provider webhook failure) — the frontend notes this.
+// ============================================================
+router.get('/payouts/history', requireAuth, requireCreator, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT id, amount_suns, usd_amount, channel, provider, status,
+             created_at, processed_at
+      FROM payouts
+      WHERE creator_id = $1
+      ORDER BY created_at DESC
+      LIMIT 50
+    `, [req.user.id]);
+    res.json({ success: true, payouts: rows });
+  } catch (err) {
+    console.error('payout history error:', err.message);
+    res.status(500).json({ error: 'Could not fetch payout history' });
+  }
+});
 
 
 // ============================================================
@@ -2376,7 +2207,9 @@ router.delete('/admin/users/:id',
 // ============================================================
 //  EXPORT
 // ============================================================
-module.exports = { router, pool: db };
+// writeDoubleEntry is exported for the payout webhook router (server.js),
+// which re-credits Suns on provider-reported failures.
+module.exports = { router, pool: db, writeDoubleEntry };
 
 /**
  * Attach to your Express app like this:

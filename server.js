@@ -14,7 +14,8 @@ const {
   uploadLimiter,
 } = require('./src/middleware/rateLimiter');
 const { Pool }       = require('pg');
-const { router: zuvaRoutes, pool: apiPool } = require('./zuva-api');
+const { router: zuvaRoutes, pool: apiPool, writeDoubleEntry } = require('./zuva-api');
+const createPayoutWebhookRouter = require('./services/payouts/webhookRouter');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -35,7 +36,12 @@ app.use(corsMiddleware);
 app.use(morgan('combined'));
 
 // ─── Body parsing ─────────────────────────────────────────────
-app.use(express.json());
+// `verify` stashes the raw bytes on req.rawBody — payout providers sign
+// webhooks over the exact body they sent, so HMAC verification must run
+// on the original bytes, never a re-serialization of the parsed JSON.
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 
 // ─── Auth middleware (requires real Clerk JWT + database user lookup) ──
 const createAuthMiddleware = require('./src/middleware/requireAuth');
@@ -43,6 +49,13 @@ const { requireAuth, requireAdmin, optionalAuth } = createAuthMiddleware(apiPool
 app.set('requireAuth', requireAuth);
 app.set('requireAdmin', requireAdmin);
 app.set('optionalAuth', optionalAuth);
+
+// ─── Payout provider webhooks ─────────────────────────────────
+// Registered BEFORE every rate limiter (specific-before-global is the
+// established ordering here): a provider retrying a burst of transfer
+// events must never be throttled into a missed status update. Each
+// request is authenticated by the adapter's signature check instead.
+app.use('/api/webhooks/payouts', createPayoutWebhookRouter(apiPool, writeDoubleEntry));
 
 // ─── Routes ───────────────────────────────────────────────────
 // Specific-path limiters are mounted before the global catch-all

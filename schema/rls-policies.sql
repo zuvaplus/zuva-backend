@@ -81,7 +81,7 @@ CREATE POLICY "ledger_entries_select_own"
 --  5. sun_purchases
 --  Buyers can read their own purchase records.
 --  Purchases are created and updated by the backend only
---  (Chimoney webhook flow).
+--  (payment provider webhook flow).
 -- =============================================================
 
 CREATE POLICY "sun_purchases_select_own"

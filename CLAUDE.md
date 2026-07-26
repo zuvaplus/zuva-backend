@@ -2,7 +2,8 @@
 
 ## Overview
 Node.js 22 / Express 5 REST API for Zuva.TV — a tipping-economy streaming platform.
-Currency unit: **Suns** (1000 Suns = $1 USD). Payouts via Chimoney API.
+Currency unit: **Suns** (1000 Suns = $1 USD). Payouts via regional provider adapters
+(Flutterwave live; Mukuru/WiPay/Wise stubbed) — see `services/payouts/`.
 
 ## Stack
 | Layer | Tech |
@@ -10,7 +11,8 @@ Currency unit: **Suns** (1000 Suns = $1 USD). Payouts via Chimoney API.
 | Runtime | Node.js >=22 |
 | Framework | Express 5 |
 | Database | PostgreSQL via `pg` (hosted on Supabase) |
-| Payments | Chimoney API (via `axios`) |
+| Payouts | Provider adapters in `services/payouts/` (Flutterwave v4 live; Mukuru, WiPay, Wise stubs) |
+| Pay-ins | None yet — `POST /api/suns/purchase` returns 503 `PURCHASES_NOT_LIVE` (Chimoney shut down May 2026) |
 | Deployment | Railway |
 
 ## Key Files
@@ -22,8 +24,12 @@ Currency unit: **Suns** (1000 Suns = $1 USD). Payouts via Chimoney API.
 ## Required Environment Variables
 ```
 DATABASE_URL=postgresql://user:pass@host:5432/zuva
-CHIMONEY_API_KEY=your_chimoney_key
-CHIMONEY_BASE_URL=https://api.chimoney.io/v0.2
+FLUTTERWAVE_SECRET_KEY=your_flutterwave_secret_key          # payouts: African mobile money + NGN bank
+FLUTTERWAVE_WEBHOOK_SECRET_HASH=your_webhook_secret_hash    # verifies /api/webhooks/payouts/flutterwave
+# FLUTTERWAVE_BASE_URL=...                                  # defaults to the developer sandbox
+MUKURU_API_KEY=placeholder                                  # ZW cash pickup (stub adapter)
+WIPAY_API_KEY=placeholder                                   # Caribbean bank settlement (stub adapter)
+WISE_API_TOKEN=placeholder                                  # GB/US/CA/AU bank transfers (stub adapter)
 PLATFORM_WALLET_ID=00000000-0000-0000-0000-000000000001
 JWT_SECRET=your_jwt_secret
 NODE_ENV=production          # switches CORS to zuva.tv
@@ -156,7 +162,36 @@ cp .env.example .env   # fill in values
 npm run dev            # node --watch server.js
 ```
 
-## Suns Economy Constants (zuva-api.js)
-- `SUNS_PER_USD = 1000`
-- `MIN_CASHOUT_SUNS = 10000` ($10 minimum)
-- `EXCHANGE_RATE_SAFETY_SPREAD = 0.99` (1% FX buffer on payouts)
+## Suns Economy Constants
+- `SUNS_PER_USD = 1000` (zuva-api.js)
+- Minimum cashout is per-corridor, in USD (`MIN_PAYOUT_USD` in `services/payouts/PayoutRouter.js`):
+  $5 for Flutterwave and Mukuru corridors, $20 for WiPay and Wise corridors
+- FX conversion happens provider-side: payouts are initiated in USD and settled in
+  the creator's local currency at the provider's rate (no in-house FX spread anymore)
+
+## Payout Architecture (`services/payouts/`)
+- `PayoutProvider.js` — adapter contract: `initiatePayout`, `verifyWebhookSignature`,
+  `parseWebhookEvent`, `getPayoutStatus`
+- `FlutterwaveAdapter.js` — live; v4 direct transfers, mobile money corridors
+  (GH/KE/TZ/UG/RW/ZM/MW/ET/CM/CI/SN) + NGN bank; HMAC-SHA256 webhook verification
+- `MukuruAdapter.js` / `WiPayAdapter.js` / `WiseAdapter.js` — stubs that throw a
+  descriptive "not yet configured" error; webhooks always rejected until implemented
+- `PayoutRouter.js` — country-code routing (African corridors → Flutterwave, ZW → Mukuru,
+  Caribbean → WiPay, GB/US/CA/AU → Wise) + per-corridor minimum enforcement
+- `webhookRouter.js` — `POST /api/webhooks/payouts/:provider`; signature check → 401 on
+  failure; `completed` finalizes, `failed` re-credits Suns atomically. Mounted in server.js
+  BEFORE all rate limiters. Requires `req.rawBody` (captured by the `express.json` verify
+  hook in server.js) — do not remove that hook.
+- Cashout flow (`POST /api/suns/cashout`): route → atomic debit + `pending` payout row in one
+  transaction → `initiatePayout` with a `crypto.randomUUID()` idempotency key → `processing`,
+  or atomic re-credit + `failed` if initiation throws. Webhook finalizes the terminal state.
+  Requires `recipientFirstName`/`recipientLastName` (legal name, stored on the payout row,
+  passed to the provider for KYC). An unconfigured provider (missing API keys) throws
+  `ProviderNotConfiguredError` → re-credit + structured 503 `PAYOUTS_NOT_CONFIGURED`; the
+  app boots and runs fine with no provider keys set at all.
+- `GET /api/payouts/options` — creator's methods by country with `configured` flags;
+  `GET /api/payouts/history` — creator's last 50 payouts
+- `scripts/flutterwave-sandbox-test.js` — end-to-end sandbox payout test (GHS MTN + KES
+  M-Pesa); prints setup instructions and exits 0 if no sandbox key is configured
+- Migration required before deploy: `schema/migrations/2026-07-25-payout-providers.sql`
+  (adds `provider`, `provider_reference`, `provider_response`, `idempotency_key` to `payouts`)

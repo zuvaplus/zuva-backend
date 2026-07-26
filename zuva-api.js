@@ -193,7 +193,14 @@ function optionalAuth(req, res, next) {
 const validate = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    return res.status(422).json({ errors: errors.array() });
+    const list = errors.array();
+    // `error` carries the human-readable message(s) — every frontend fetch
+    // helper surfaces body.error, so validation failures show as e.g.
+    // "Invalid application ID" instead of a generic "Request failed (422)".
+    return res.status(422).json({
+      error: [...new Set(list.map((e) => e.msg))].join('; '),
+      errors: list,
+    });
   }
   next();
 };
@@ -1397,7 +1404,7 @@ async function fetchWildcard(db, orientation, limit, usedIds) {
 //  Run this SQL once against the database before using this route:
 //
 //  CREATE TABLE creator_applications (
-//    id                SERIAL PRIMARY KEY,
+//    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),  -- live table is UUID, not SERIAL
 //    full_name         TEXT NOT NULL,
 //    email             TEXT NOT NULL,
 //    country           TEXT NOT NULL,
@@ -2288,7 +2295,9 @@ router.get('/admin/applications', requireAdmin, async (req, res) => {
 router.patch('/admin/applications/:id',
   requireAdmin,
   [
-    param('id').isInt().withMessage('Invalid application ID'),
+    // The live creator_applications.id column is UUID (verified in
+    // Supabase 2026-07-26) — an isInt() here 422'd every approval.
+    param('id').isUUID().withMessage('Invalid application ID'),
     body('status').isIn(['approved', 'rejected']).withMessage('Invalid status'),
   ],
   validate,

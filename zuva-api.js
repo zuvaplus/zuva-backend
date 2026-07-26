@@ -954,7 +954,7 @@ router.get('/creator/earnings/:creatorId',
 // for why these two fields coexist.
 const CONTENT_CATEGORIES = [
   'entertainment', 'music', 'comedy', 'drama_series', 'documentary',
-  'discussion_debate', 'interview', 'lifestyle_culture', 'news', 'other',
+  'discussion_debate', 'interview', 'lifestyle_culture', 'news', 'nature', 'other',
 ];
 
 // The "Documentary & Discussion" umbrella — a code-level grouping only,
@@ -1120,32 +1120,102 @@ function buildRankedFeed(candidates, viewer, offset, limit) {
 // enough that fetching this many rows per request stops being cheap.
 const FEED_CANDIDATE_POOL_SIZE = 500;
 
+// ── Homepage fallback: shuffled top-ranked mix ──────────────────
+// For anonymous viewers, or signed-in viewers with zero watch_events —
+// the personalized buildRankedFeed above collapses to a flat,
+// deterministic "trending + recency" order for someone with no signal
+// to personalize against, which looks stale on every repeat visit. This
+// fallback instead takes the top-scored candidates *per category* (so
+// "across all categories" holds regardless of the raw score
+// distribution) and shuffles them with a seed derived from the current
+// time bucket — deterministic *within* that bucket (many concurrent
+// anonymous viewers see the same order, not a different shuffle per
+// request) and automatically different once the bucket rolls over.
+const FALLBACK_RESEED_BUCKET_MINUTES = 20; // within the requested 15-30 min window
+const FALLBACK_TOP_PER_CATEGORY = 15;
+
+// mulberry32 — small, fast, deterministic PRNG. Not cryptographic (and
+// doesn't need to be); only used to turn an integer seed into a stable
+// shuffle order.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function seededShuffle(array, seed) {
+  const rand = mulberry32(seed);
+  const result = [...array];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+
+function buildFallbackFeed(candidates, offset, limit) {
+  const scored = candidates
+    .map((v) => ({ ...v, _score: computeFeedScore(v, null) }))
+    .sort((a, b) => b._score - a._score);
+
+  const categoryCounts = new Map();
+  const pool = [];
+  for (const v of scored) {
+    const count = categoryCounts.get(v.content_category) || 0;
+    if (count >= FALLBACK_TOP_PER_CATEGORY) continue;
+    categoryCounts.set(v.content_category, count + 1);
+    pool.push(v);
+  }
+
+  const bucketSeed = Math.floor(Date.now() / (FALLBACK_RESEED_BUCKET_MINUTES * 60000));
+  return seededShuffle(pool, bucketSeed).slice(offset, offset + limit);
+}
+
 // ============================================================
 //  GET /api/feed
 //  Scored, category-floor-adjusted, paginated main feed. Works for
-//  anonymous viewers (optionalAuth) — see buildRankedFeed's fallback
-//  behavior above. Excludes Flares (is_flare = true) entirely; Flares
-//  has its own separate feed and ranking (GET /api/flares/feed).
+//  anonymous viewers (optionalAuth) — see buildFallbackFeed above for
+//  anonymous/no-history viewers, buildRankedFeed for everyone else.
+//  Excludes Flares (is_flare = true) entirely; Flares has its own
+//  separate feed and ranking (GET /api/flares/feed).
+//
+//  Optional query params:
+//    content_category  filters to one CONTENT_CATEGORIES value
+//    country           filters to one creator country_code (2-letter)
+//  Both apply to the candidate pool before scoring — orthogonal to
+//  which ranking path (personalized vs. fallback) ends up being used.
 // ============================================================
 router.get('/feed',
   optionalAuth,
   [
     query('limit').optional().isInt({ min: 1, max: 50 }).toInt(),
     query('offset').optional().isInt({ min: 0 }).toInt(),
+    query('content_category').optional().trim().isIn(CONTENT_CATEGORIES).withMessage('Invalid content_category'),
+    query('country').optional().trim().isLength({ min: 2, max: 2 }).withMessage('country must be a 2-letter code'),
   ],
   validate,
   async (req, res) => {
     const limit  = req.query.limit || 30;
     const offset = req.query.offset || 0;
+    const contentCategoryFilter = req.query.content_category || null;
+    const countryFilter = req.query.country || null;
 
     try {
       let viewer = null;
+      let hasHistory = false;
       if (req.user) {
         const { rows: viewerRows } = await db.query(
-          `SELECT preferred_country, preferred_languages FROM users WHERE id = $1`,
+          `SELECT preferred_country, preferred_languages,
+                  EXISTS (SELECT 1 FROM watch_events WHERE user_id = $1) AS has_history
+           FROM users WHERE id = $1`,
           [req.user.id]
         );
         viewer = viewerRows[0] || null;
+        hasHistory = viewer?.has_history === true;
       }
 
       const { rows } = await db.query(`
@@ -1172,11 +1242,18 @@ router.get('/feed',
           GROUP BY content_id
         ) t ON t.content_id = v.id
         WHERE v.status = 'published' AND v.is_flare = false
+          AND ($2::text IS NULL OR v.content_category = $2)
+          AND ($3::text IS NULL OR u.country_code = $3)
         ORDER BY v.created_at DESC
         LIMIT $1
-      `, [FEED_CANDIDATE_POOL_SIZE]);
+      `, [FEED_CANDIDATE_POOL_SIZE, contentCategoryFilter, countryFilter]);
 
-      const page = buildRankedFeed(rows, viewer, offset, limit).map((r) => ({
+      const useFallback = !req.user || !hasHistory;
+      const assembled = useFallback
+        ? buildFallbackFeed(rows, offset, limit)
+        : buildRankedFeed(rows, viewer, offset, limit);
+
+      const page = assembled.map((r) => ({
         id: r.id, title: r.title, description: r.description,
         cloudflare_video_id: r.cloudflare_video_id, thumbnail_url: r.thumbnail_url,
         duration_seconds: r.duration_seconds, view_count: r.view_count,
@@ -1611,6 +1688,9 @@ router.post('/upload/video',
     body('description').optional().trim().isLength({ max: 2000 }).withMessage('Description must be at most 2000 characters'),
     body('category').trim().isIn(VALID_VIDEO_CATEGORIES).withMessage('Invalid category'),
     body('content_category').trim().isIn(CONTENT_CATEGORIES).withMessage('Invalid content_category'),
+    // Self-disclosure, required — no default in the client form, so this
+    // must be explicitly present on every upload rather than .optional().
+    body('contains_synthetic_media').isBoolean().withMessage('contains_synthetic_media is required'),
     body('tags').optional().isString().withMessage('tags must be a comma-separated string'),
     body('creator_id').optional().isUUID().withMessage('Invalid creator_id'),
     body('is_flare').optional().isBoolean().withMessage('is_flare must be a boolean'),
@@ -1633,6 +1713,7 @@ router.post('/upload/video',
     const { title, description, category, content_category: contentCategory } = req.body;
     const tags = (req.body.tags || '').split(',').map((t) => t.trim()).filter(Boolean);
     const isFlare = req.body.is_flare === true || req.body.is_flare === 'true';
+    const containsSyntheticMedia = req.body.contains_synthetic_media === true || req.body.contains_synthetic_media === 'true';
 
     try {
       // ── Upload the file to Cloudflare Stream ────────────────
@@ -1673,12 +1754,12 @@ router.post('/upload/video',
       // is used regardless of what the frontend's optional thumbnail field sends.
       const { rows } = await db.query(`
         INSERT INTO videos
-          (creator_id, title, description, category, content_category, tags, cloudflare_video_id, thumbnail_url, duration_seconds, is_flare)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          (creator_id, title, description, category, content_category, tags, cloudflare_video_id, thumbnail_url, duration_seconds, is_flare, contains_synthetic_media)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING *
       `, [
         req.user.id, title, description || null, category, contentCategory, tags,
-        cf.uid, cf.thumbnail || null, durationSeconds, isFlare,
+        cf.uid, cf.thumbnail || null, durationSeconds, isFlare, containsSyntheticMedia,
       ]);
 
       let video = rows[0];
@@ -2420,6 +2501,7 @@ router.get('/video/:id',
         thumbnail_url: row.thumbnail_url, duration_seconds: row.duration_seconds,
         status: row.status, view_count: row.view_count, created_at: row.created_at,
         like_count: row.like_count ?? 0, comment_count: row.comment_count ?? 0,
+        contains_synthetic_media: row.contains_synthetic_media ?? false,
       };
       const creator = {
         id: row.c_id, username: row.c_username, display_name: row.c_display_name,

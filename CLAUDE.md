@@ -233,7 +233,41 @@ npm run dev            # node --watch server.js
   (`VALID_VIDEO_CATEGORIES` — Comedy/Drama/Music/News/Sports/Lifestyle/Education/
   Other), which stays as-is and is still used for admin/related-videos. Two
   category-like fields now coexist on `videos` — reconcile eventually, not done
-  as part of this task
+  as part of this task. `content_category` now has 11 values (added `nature`;
+  `news` already existed) — see `CONTENT_CATEGORIES` in zuva-api.js
+- `GET /api/feed` also takes optional `content_category` and `country` (2-letter
+  `users.country_code`) query params — both filter the SQL candidate pool before
+  scoring, orthogonal to which ranking path a viewer gets. Reached from the
+  frontend homepage's category/country bar via `/feed?content_category=` or
+  `/feed?country=`
+- **Homepage fallback ranking** — anonymous viewers, or signed-in viewers with
+  zero `watch_events` rows, don't get `buildRankedFeed`'s personalized path at
+  all (it would just collapse to a flat, identical-every-visit "trending +
+  recency" order with no signal to personalize against). Instead
+  `buildFallbackFeed` takes the top `FALLBACK_TOP_PER_CATEGORY` (15) scored
+  candidates *per content_category* — so "across all categories" holds
+  regardless of the raw score distribution — and shuffles them with
+  `seededShuffle`/`mulberry32`, seeded from `Math.floor(Date.now() /
+  (FALLBACK_RESEED_BUCKET_MINUTES * 60000))` (20-minute buckets). Deterministic
+  *within* a bucket (concurrent anonymous viewers see the same order, not a
+  different shuffle per request) and automatically different once the bucket
+  rolls over — server-side time-bucketed reseeding, not `Math.random()` per
+  request. The route decides which path to use per-request (`useFallback = !req.user
+  || !hasHistory`, where `hasHistory` comes from an `EXISTS (SELECT 1 FROM
+  watch_events WHERE user_id = ...)` check) — the frontend never needs to know
+  which one it got
+
+## AI-content disclosure
+- Self-disclosure only — **no automated detection**. `videos.contains_synthetic_media`
+  (`BOOLEAN NOT NULL DEFAULT false`), required (not `.optional()`) on
+  `POST /api/upload/video` — the client form has no default selection either, so
+  every new upload has to make an active Yes/No choice
+- `computeFeedScore` / `computeFlareScore` never read this column — confirmed by
+  grep, not just by construction — it has zero effect on ranking, discoverability,
+  or monetization, exactly per spec
+- Only surfaced on `GET /api/video/:id` (the long-form watch page badge) — not
+  added to the `GET /api/feed` / `GET /api/flares/feed` response shapes, since
+  nothing renders it there
 
 ## Flares (short-form vertical feed)
 - Same `videos` table/Cloudflare Stream pipeline as long-form uploads — `is_flare`

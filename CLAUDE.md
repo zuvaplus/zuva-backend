@@ -162,6 +162,19 @@ cp .env.example .env   # fill in values
 npm run dev            # node --watch server.js
 ```
 
+## Engagement Layer (likes / comments / subscriptions)
+- Tables: `video_likes`, `comments` (one-level replies via `parent_comment_id`; status
+  visible/hidden/deleted), `subscriptions` — see `schema/migrations/2026-07-26-engagement.sql`
+- Denormalized counters (`videos.like_count`, `videos.comment_count`, `users.follower_count`)
+  are trigger-recomputed from the source tables — never incremented in app code
+- Routes: POST/DELETE `/api/video/:id/like` (idempotent), POST/GET `/api/video/:id/comments`
+  (paginated, replies nested; soft delete keeps rows, body nulled), DELETE `/api/comments/:id`
+  (own only), POST/DELETE `/api/creator/:id/subscribe`, admin `GET /api/admin/comments` +
+  `PATCH /api/admin/comments/:id` (visible|hidden)
+- `GET /api/video/:id` runs optionalAuth and returns `viewer.has_liked` / `viewer.is_subscribed`
+- Comment creation is limited to 5/min (commentLimiter, mounted in server.js before the
+  global limiter, method+path scoped so GETs aren't throttled)
+
 ## Suns Economy Constants
 - `SUNS_PER_USD = 1000` (zuva-api.js)
 - Minimum cashout is per-corridor, in USD (`MIN_PAYOUT_USD` in `services/payouts/PayoutRouter.js`):

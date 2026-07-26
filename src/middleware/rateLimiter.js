@@ -77,6 +77,18 @@ const sunsLimiter = rateLimit({
   message: { error: 'Too many Sun transactions, please slow down.' },
 });
 
+// ── POST /api/video/:id/comments — comment creation ──────────
+// 5 per minute. Keyed per IP (the client hasn't been authenticated at
+// limiter time; Clerk tokens also rotate every ~60s, which would reset
+// a token-keyed bucket) — close enough to "per user" for spam control.
+const commentLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'You are commenting too fast — wait a moment and try again.' },
+});
+
 // ── /api/upload/* — video upload endpoints ────────────────────
 // 10 requests per 1 hour. Each upload proxies up to 2GB through this
 // server to Cloudflare Stream, so this cap is deliberately strict.
@@ -96,4 +108,5 @@ module.exports = {
   tipLimiter,
   sunsLimiter,
   uploadLimiter,
+  commentLimiter,
 };

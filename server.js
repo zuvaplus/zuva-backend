@@ -12,6 +12,7 @@ const {
   tipLimiter,
   sunsLimiter,
   uploadLimiter,
+  commentLimiter,
 } = require('./src/middleware/rateLimiter');
 const { Pool }       = require('pg');
 const { router: zuvaRoutes, pool: apiPool, writeDoubleEntry } = require('./zuva-api');
@@ -61,6 +62,15 @@ app.use('/api/webhooks/payouts', createPayoutWebhookRouter(apiPool, writeDoubleE
 // Specific-path limiters are mounted before the global catch-all
 // so a request to /api/suns/tip hits tipLimiter first, then
 // sunsLimiter, then apiLimiter — all three buckets consumed.
+// Comment creation only — 5/min. Scoped by method + path shape so the
+// GET comments list and the other /api/video/* routes aren't throttled.
+app.use((req, res, next) => {
+  if (req.method === 'POST' && /^\/api\/video\/[^/]+\/comments\/?$/.test(req.path)) {
+    return commentLimiter(req, res, next);
+  }
+  next();
+});
+
 app.use('/api/suns/purchase', purchaseLimiter); //  10 req / 1 hour
 app.use('/api/suns/cashout',  purchaseLimiter); //  10 req / 1 hour
 app.use('/api/suns/tip',      tipLimiter);      //   5 req / 1 min

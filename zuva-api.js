@@ -1757,8 +1757,11 @@ router.patch('/channel/update',
 // ── GET /api/video/:id ────────────────────────────────────────
 // Only serves published videos (matches the visibility convention used by
 // the existing feed queries) and increments view_count on every fetch.
-// Also returns up to 6 related videos from the same category.
+// Also returns up to 6 related videos from the same category, plus the
+// viewer's engagement state (has_liked / is_subscribed — false for
+// anonymous viewers, resolved via optionalAuth for signed-in ones).
 router.get('/video/:id',
+  optionalAuth,
   [param('id').isUUID().withMessage('Invalid video ID')],
   validate,
   async (req, res) => {
@@ -1784,11 +1787,23 @@ router.get('/video/:id',
         category: row.category, tags: row.tags, cloudflare_video_id: row.cloudflare_video_id,
         thumbnail_url: row.thumbnail_url, duration_seconds: row.duration_seconds,
         status: row.status, view_count: row.view_count, created_at: row.created_at,
+        like_count: row.like_count ?? 0, comment_count: row.comment_count ?? 0,
       };
       const creator = {
         id: row.c_id, username: row.c_username, display_name: row.c_display_name,
         avatar_url: row.c_avatar_url, follower_count: row.c_follower_count,
       };
+
+      // Viewer engagement state — anonymous viewers get false/false.
+      let viewer = { has_liked: false, is_subscribed: false };
+      if (req.user) {
+        const { rows: v } = await db.query(`
+          SELECT
+            EXISTS (SELECT 1 FROM video_likes   WHERE video_id = $1 AND user_id = $2)       AS has_liked,
+            EXISTS (SELECT 1 FROM subscriptions WHERE creator_id = $3 AND subscriber_id = $2) AS is_subscribed
+        `, [video.id, req.user.id, video.creator_id]);
+        viewer = v[0];
+      }
 
       const { rows: related } = await db.query(`
         SELECT id, title, thumbnail_url, duration_seconds, view_count, created_at
@@ -1798,10 +1813,329 @@ router.get('/video/:id',
         LIMIT 6
       `, [video.category, video.id]);
 
-      res.json({ success: true, video, creator, related_videos: related });
+      res.json({ success: true, video, creator, viewer, related_videos: related });
     } catch (err) {
       console.error('video fetch error:', err.message);
       res.status(500).json({ error: 'Could not fetch video' });
+    }
+  }
+);
+
+
+// ============================================================
+//  ENGAGEMENT: likes, comments, subscriptions
+// ============================================================
+
+// Shared guard: the video must exist and be published before any
+// engagement writes land on it.
+async function getPublishedVideo(videoId) {
+  const { rows } = await db.query(
+    `SELECT id, creator_id FROM videos WHERE id = $1 AND status = 'published'`,
+    [videoId]
+  );
+  return rows[0] ?? null;
+}
+
+// ── POST /api/video/:id/like ──────────────────────────────────
+// Idempotent: liking an already-liked video is a no-op success, not an
+// error (ON CONFLICT DO NOTHING against the UNIQUE(video_id, user_id)).
+// The like_count trigger recounts from video_likes on insert/delete.
+router.post('/video/:id/like',
+  requireAuth,
+  [param('id').isUUID().withMessage('Invalid video ID')],
+  validate,
+  async (req, res) => {
+    try {
+      const video = await getPublishedVideo(req.params.id);
+      if (!video) return res.status(404).json({ error: 'Video not found' });
+
+      await db.query(`
+        INSERT INTO video_likes (video_id, user_id)
+        VALUES ($1, $2)
+        ON CONFLICT (video_id, user_id) DO NOTHING
+      `, [video.id, req.user.id]);
+
+      const { rows } = await db.query('SELECT like_count FROM videos WHERE id = $1', [video.id]);
+      res.json({ success: true, liked: true, like_count: rows[0].like_count });
+    } catch (err) {
+      console.error('like error:', err.message);
+      res.status(500).json({ error: 'Could not like video' });
+    }
+  }
+);
+
+// ── DELETE /api/video/:id/like ────────────────────────────────
+router.delete('/video/:id/like',
+  requireAuth,
+  [param('id').isUUID().withMessage('Invalid video ID')],
+  validate,
+  async (req, res) => {
+    try {
+      await db.query(
+        'DELETE FROM video_likes WHERE video_id = $1 AND user_id = $2',
+        [req.params.id, req.user.id]
+      );
+      const { rows } = await db.query('SELECT like_count FROM videos WHERE id = $1', [req.params.id]);
+      res.json({ success: true, liked: false, like_count: rows[0]?.like_count ?? 0 });
+    } catch (err) {
+      console.error('unlike error:', err.message);
+      res.status(500).json({ error: 'Could not unlike video' });
+    }
+  }
+);
+
+// ── POST /api/video/:id/comments ──────────────────────────────
+// One level of nesting only: a reply's parent must be a top-level
+// comment on the same video. Rate-limited to 5/min in server.js
+// (registered before the global limiter, per the mount-order pattern).
+router.post('/video/:id/comments',
+  requireAuth,
+  [
+    param('id').isUUID().withMessage('Invalid video ID'),
+    body('body')
+      .isString().trim().isLength({ min: 1, max: 2000 })
+      .withMessage('Comment must be 1–2000 characters'),
+    body('parentCommentId')
+      .optional()
+      .isUUID().withMessage('Invalid parent comment ID'),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const video = await getPublishedVideo(req.params.id);
+      if (!video) return res.status(404).json({ error: 'Video not found' });
+
+      const { body: commentBody, parentCommentId } = req.body;
+
+      if (parentCommentId) {
+        const { rows: parents } = await db.query(
+          `SELECT id, video_id, parent_comment_id, status FROM comments WHERE id = $1`,
+          [parentCommentId]
+        );
+        const parent = parents[0];
+        if (!parent || parent.video_id !== video.id || parent.status === 'hidden') {
+          return res.status(404).json({ error: 'Comment not found' });
+        }
+        if (parent.parent_comment_id !== null) {
+          return res.status(400).json({ error: 'Replies to replies are not supported' });
+        }
+      }
+
+      const { rows } = await db.query(`
+        INSERT INTO comments (video_id, user_id, parent_comment_id, body)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, video_id, parent_comment_id, body, status, created_at
+      `, [video.id, req.user.id, parentCommentId ?? null, commentBody]);
+
+      const comment = {
+        ...rows[0],
+        is_own: true,
+        user: {
+          id: req.user.id,
+          username: req.user.username,
+          display_name: req.user.username, // display_name isn't on req.user; frontend falls back
+          avatar_url: null,
+        },
+      };
+      // Fill real display name + avatar for the response
+      const { rows: u } = await db.query(
+        'SELECT display_name, avatar_url FROM users WHERE id = $1', [req.user.id]
+      );
+      if (u[0]) {
+        comment.user.display_name = u[0].display_name;
+        comment.user.avatar_url = u[0].avatar_url;
+      }
+
+      res.status(201).json({ success: true, comment });
+    } catch (err) {
+      console.error('comment create error:', err.message);
+      res.status(500).json({ error: 'Could not post comment' });
+    }
+  }
+);
+
+// ── GET /api/video/:id/comments?page=&limit= ──────────────────
+// Public. Top-level comments newest-first, replies nested oldest-first.
+// Soft-deleted top-level comments are kept (body → null) so their
+// replies don't orphan; deleted replies and anything 'hidden' are
+// omitted entirely.
+router.get('/video/:id/comments',
+  optionalAuth,
+  [
+    param('id').isUUID().withMessage('Invalid video ID'),
+    query('page').optional().isInt({ min: 1 }),
+    query('limit').optional().isInt({ min: 1, max: 50 }),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const page   = parseInt(req.query.page ?? '1', 10);
+      const limit  = parseInt(req.query.limit ?? '20', 10);
+      const offset = (page - 1) * limit;
+      const viewerId = req.user?.id ?? null;
+
+      const { rows: parents } = await db.query(`
+        SELECT c.id, c.parent_comment_id, c.status, c.created_at,
+               CASE WHEN c.status = 'deleted' THEN NULL ELSE c.body END AS body,
+               (c.user_id = $4) AS is_own,
+               u.id AS u_id, u.username, u.display_name, u.avatar_url
+        FROM comments c
+        JOIN users u ON u.id = c.user_id
+        WHERE c.video_id = $1
+          AND c.parent_comment_id IS NULL
+          AND c.status <> 'hidden'
+        ORDER BY c.created_at DESC
+        LIMIT $2 OFFSET $3
+      `, [req.params.id, limit + 1, offset, viewerId]);
+
+      const hasMore = parents.length > limit;
+      const pageParents = parents.slice(0, limit);
+
+      let repliesByParent = {};
+      if (pageParents.length) {
+        const parentIds = pageParents.map((p) => p.id);
+        const { rows: replies } = await db.query(`
+          SELECT c.id, c.parent_comment_id, c.status, c.created_at, c.body,
+                 (c.user_id = $2) AS is_own,
+                 u.id AS u_id, u.username, u.display_name, u.avatar_url
+          FROM comments c
+          JOIN users u ON u.id = c.user_id
+          WHERE c.parent_comment_id = ANY($1)
+            AND c.status = 'visible'
+          ORDER BY c.created_at ASC
+        `, [parentIds, viewerId]);
+
+        repliesByParent = replies.reduce((acc, r) => {
+          (acc[r.parent_comment_id] ??= []).push(shapeComment(r));
+          return acc;
+        }, {});
+      }
+
+      function shapeComment(r) {
+        return {
+          id: r.id,
+          parent_comment_id: r.parent_comment_id,
+          body: r.body,
+          status: r.status,
+          created_at: r.created_at,
+          is_own: r.is_own === true,
+          user: { id: r.u_id, username: r.username, display_name: r.display_name, avatar_url: r.avatar_url },
+        };
+      }
+
+      const comments = pageParents.map((p) => ({
+        ...shapeComment(p),
+        replies: repliesByParent[p.id] ?? [],
+      }));
+
+      const { rows: counts } = await db.query(
+        'SELECT comment_count FROM videos WHERE id = $1', [req.params.id]
+      );
+
+      res.json({
+        success: true,
+        comments,
+        comment_count: counts[0]?.comment_count ?? 0,
+        has_more: hasMore,
+        page,
+      });
+    } catch (err) {
+      console.error('comments fetch error:', err.message);
+      res.status(500).json({ error: 'Could not fetch comments' });
+    }
+  }
+);
+
+// ── DELETE /api/comments/:id ──────────────────────────────────
+// Soft delete of the caller's OWN comment: status → 'deleted', row kept
+// so replies don't orphan. The comment_count trigger recounts (only
+// 'visible' rows count). Responses always null the body of deleted rows.
+router.delete('/comments/:id',
+  requireAuth,
+  [param('id').isUUID().withMessage('Invalid comment ID')],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        UPDATE comments SET status = 'deleted'
+        WHERE id = $1 AND user_id = $2 AND status = 'visible'
+        RETURNING id
+      `, [req.params.id, req.user.id]);
+
+      if (!rows.length) {
+        // Either it doesn't exist, isn't theirs, or is already deleted/hidden.
+        const { rows: exists } = await db.query(
+          'SELECT user_id FROM comments WHERE id = $1', [req.params.id]
+        );
+        if (exists.length && exists[0].user_id !== req.user.id) {
+          return res.status(403).json({ error: 'You can only delete your own comments' });
+        }
+        return res.status(404).json({ error: 'Comment not found' });
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error('comment delete error:', err.message);
+      res.status(500).json({ error: 'Could not delete comment' });
+    }
+  }
+);
+
+// ── POST /api/creator/:id/subscribe ───────────────────────────
+// Idempotent, like the like route. The DB CHECK also blocks
+// self-subscription, but we return a friendly 400 before hitting it.
+router.post('/creator/:id/subscribe',
+  requireAuth,
+  [param('id').isUUID().withMessage('Invalid creator ID')],
+  validate,
+  async (req, res) => {
+    try {
+      if (req.params.id === req.user.id) {
+        return res.status(400).json({ error: 'You cannot subscribe to yourself' });
+      }
+      const { rows: target } = await db.query(
+        `SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL AND status = 'active'`,
+        [req.params.id]
+      );
+      if (!target.length) return res.status(404).json({ error: 'Creator not found' });
+
+      await db.query(`
+        INSERT INTO subscriptions (creator_id, subscriber_id)
+        VALUES ($1, $2)
+        ON CONFLICT (creator_id, subscriber_id) DO NOTHING
+      `, [req.params.id, req.user.id]);
+
+      const { rows } = await db.query(
+        'SELECT COALESCE(follower_count, 0) AS follower_count FROM users WHERE id = $1',
+        [req.params.id]
+      );
+      res.json({ success: true, subscribed: true, follower_count: rows[0].follower_count });
+    } catch (err) {
+      console.error('subscribe error:', err.message);
+      res.status(500).json({ error: 'Could not subscribe' });
+    }
+  }
+);
+
+// ── DELETE /api/creator/:id/subscribe ─────────────────────────
+router.delete('/creator/:id/subscribe',
+  requireAuth,
+  [param('id').isUUID().withMessage('Invalid creator ID')],
+  validate,
+  async (req, res) => {
+    try {
+      await db.query(
+        'DELETE FROM subscriptions WHERE creator_id = $1 AND subscriber_id = $2',
+        [req.params.id, req.user.id]
+      );
+      const { rows } = await db.query(
+        'SELECT COALESCE(follower_count, 0) AS follower_count FROM users WHERE id = $1',
+        [req.params.id]
+      );
+      res.json({ success: true, subscribed: false, follower_count: rows[0]?.follower_count ?? 0 });
+    } catch (err) {
+      console.error('unsubscribe error:', err.message);
+      res.status(500).json({ error: 'Could not unsubscribe' });
     }
   }
 );
@@ -2128,6 +2462,57 @@ router.get('/admin/moderation-queue', requireAdmin, async (req, res) => {
     res.status(500).json({ error: 'Could not fetch moderation queue' });
   }
 });
+
+// ── GET /api/admin/comments ──────────────────────────────────
+// Recent comments across all videos (newest first, capped at 100) so
+// admins can spot abuse. Includes hidden/deleted for full visibility.
+router.get('/admin/comments', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT c.id, c.body, c.status, c.created_at, c.parent_comment_id,
+             c.video_id, v.title AS video_title,
+             c.user_id, COALESCE(u.display_name, u.username, 'Unknown') AS commenter_name,
+             u.email AS commenter_email
+      FROM comments c
+      LEFT JOIN videos v ON v.id = c.video_id
+      LEFT JOIN users  u ON u.id = c.user_id
+      ORDER BY c.created_at DESC
+      LIMIT 100
+    `);
+    res.json({ success: true, comments: rows });
+  } catch (err) {
+    console.error('admin comments fetch error:', err.message);
+    res.status(500).json({ error: 'Could not fetch comments' });
+  }
+});
+
+// ── PATCH /api/admin/comments/:id ────────────────────────────
+// Moderation toggle: 'hidden' pulls a comment (and its replies, which
+// the list queries exclude when the parent is hidden) from public view;
+// 'visible' restores it. 'deleted' stays user-only — admins hide.
+router.patch('/admin/comments/:id',
+  requireAdmin,
+  [
+    param('id').isUUID().withMessage('Invalid comment ID'),
+    body('status').isIn(['visible', 'hidden']).withMessage('Status must be visible or hidden'),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        UPDATE comments SET status = $1
+        WHERE id = $2 AND status <> 'deleted'
+        RETURNING id, status
+      `, [req.body.status, req.params.id]);
+
+      if (!rows.length) return res.status(404).json({ error: 'Comment not found' });
+      res.json({ success: true, comment: rows[0] });
+    } catch (err) {
+      console.error('admin comment status error:', err.message);
+      res.status(500).json({ error: 'Could not update comment' });
+    }
+  }
+);
 
 // ── GET /api/admin/users ─────────────────────────────────────
 // Assumes users has email, country_code, role, created_at columns

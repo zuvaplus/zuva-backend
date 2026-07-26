@@ -191,6 +191,37 @@ const videoUpload = multer({
   },
 });
 
+// ─── Caption upload middleware (multer) ────────────────────────
+// Memory storage — caption files are plain text (SRT/VTT), never more
+// than a few hundred KB, so buffering in RAM is fine (unlike video).
+const captionUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB — generous for a subtitle file
+  fileFilter: (req, file, cb) => {
+    const allowed = ['.srt', '.vtt'];
+    cb(null, allowed.includes(path.extname(file.originalname).toLowerCase()));
+  },
+});
+
+// Curated caption languages matching Zuva's African & Caribbean audience.
+// Values are the BCP-47-ish codes Cloudflare Stream's captions API expects.
+const CAPTION_LANGUAGES = ['en', 'fr', 'pt', 'sw', 'ar', 'es', 'ht', 'yo', 'ha', 'zu', 'am'];
+
+// Cloudflare Stream's captions endpoint only accepts WebVTT — SRT is a
+// different (if closely related) format, so creators uploading .srt need
+// a lossless conversion first: strip the numeric cue-sequence lines SRT
+// uses and VTT doesn't, and swap the comma decimal separator in
+// timestamps for VTT's required period.
+function srtToVtt(srtText) {
+  const normalized = srtText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  const body = normalized
+    .split('\n')
+    .filter((line) => !/^\d+$/.test(line.trim()))
+    .join('\n')
+    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  return `WEBVTT\n\n${body}\n`;
+}
+
 // ─── Constants ────────────────────────────────────────────────
 const SUNS_PER_USD        = 1000;  // 1000 Suns = $1.00 USD
 const PLATFORM_WALLET_ID  = process.env.PLATFORM_WALLET_ID;
@@ -1826,6 +1857,121 @@ router.get('/upload/status/:videoId',
     } catch (err) {
       console.error('upload status error:', err.response?.data ?? err.message);
       res.status(500).json({ error: 'Could not fetch upload status' });
+    }
+  }
+);
+
+// ── Captions / subtitles (Cloudflare Stream captions API) ────────
+// No local table — Cloudflare is the sole source of truth for which
+// caption tracks exist on a video, same philosophy as thumbnail_url/
+// duration_seconds being synced FROM Cloudflare rather than owned here.
+// The player already renders via Cloudflare's own iframe embed
+// (iframe.cloudflarestream.com/{uid}), which shows a native CC toggle
+// automatically once tracks exist — no custom player work needed.
+
+// Shared ownership guard: video must exist and belong to the caller.
+async function getOwnVideo(videoId, creatorId) {
+  const { rows } = await db.query(
+    'SELECT id, creator_id, cloudflare_video_id FROM videos WHERE id = $1',
+    [videoId]
+  );
+  const video = rows[0];
+  if (!video || video.creator_id !== creatorId) return null;
+  return video;
+}
+
+// ── GET /api/upload/video/:videoId/captions ──────────────────────
+router.get('/upload/video/:videoId/captions',
+  requireClerkUser,
+  requireCreator,
+  [param('videoId').isUUID().withMessage('Invalid video ID')],
+  validate,
+  async (req, res) => {
+    try {
+      const video = await getOwnVideo(req.params.videoId, req.user.id);
+      if (!video) return res.status(404).json({ error: 'Video not found' });
+
+      const cfRes = await cloudflareStream.get(`/${video.cloudflare_video_id}/captions`);
+      const tracks = (cfRes.data?.result ?? []).map((c) => ({
+        language: c.language,
+        label: c.label,
+        status: c.status,
+      }));
+      res.json({ success: true, captions: tracks });
+    } catch (err) {
+      console.error('captions list error:', err.response?.data ?? err.message);
+      res.status(500).json({ error: 'Could not fetch captions' });
+    }
+  }
+);
+
+// ── POST /api/upload/video/:videoId/captions ──────────────────────
+// Accepts .srt or .vtt (field "file") + a "language" code; converts SRT
+// to WebVTT if needed (Cloudflare's captions API only accepts VTT) and
+// PUTs it to Cloudflare. Creators can call this once per language to
+// build up multiple caption tracks on the same video.
+router.post('/upload/video/:videoId/captions',
+  requireClerkUser,
+  requireCreator,
+  captionUpload.single('file'),
+  [
+    param('videoId').isUUID().withMessage('Invalid video ID'),
+    body('language').isIn(CAPTION_LANGUAGES).withMessage(`language must be one of: ${CAPTION_LANGUAGES.join(', ')}`),
+  ],
+  validate,
+  async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'A caption file is required (field "file", .srt or .vtt)' });
+    }
+
+    try {
+      const video = await getOwnVideo(req.params.videoId, req.user.id);
+      if (!video) return res.status(404).json({ error: 'Video not found' });
+
+      const raw = req.file.buffer.toString('utf-8');
+      const isSrt = path.extname(req.file.originalname).toLowerCase() === '.srt'
+        && !raw.trim().startsWith('WEBVTT');
+      const vtt = isSrt ? srtToVtt(raw) : raw;
+
+      const form = new FormData();
+      form.append('file', Buffer.from(vtt, 'utf-8'), {
+        filename: `${req.body.language}.vtt`,
+        contentType: 'text/vtt',
+      });
+
+      await cloudflareStream.put(
+        `/${video.cloudflare_video_id}/captions/${req.body.language}`,
+        form,
+        { headers: form.getHeaders() }
+      );
+
+      res.status(201).json({ success: true, language: req.body.language });
+    } catch (err) {
+      console.error('caption upload error:', err.response?.data ?? err.message);
+      res.status(502).json({ error: 'Could not upload caption track to Cloudflare Stream' });
+    }
+  }
+);
+
+// ── DELETE /api/upload/video/:videoId/captions/:language ──────────
+router.delete('/upload/video/:videoId/captions/:language',
+  requireClerkUser,
+  requireCreator,
+  [
+    param('videoId').isUUID().withMessage('Invalid video ID'),
+    param('language').isIn(CAPTION_LANGUAGES).withMessage('Invalid language code'),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const video = await getOwnVideo(req.params.videoId, req.user.id);
+      if (!video) return res.status(404).json({ error: 'Video not found' });
+
+      await cloudflareStream.delete(`/${video.cloudflare_video_id}/captions/${req.params.language}`);
+      res.json({ success: true });
+    } catch (err) {
+      console.error('caption delete error:', err.response?.data ?? err.message);
+      res.status(502).json({ error: 'Could not delete caption track' });
     }
   }
 );

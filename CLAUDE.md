@@ -190,6 +190,21 @@ npm run dev            # node --watch server.js
   role='creator' (requireCreator, mounted before multer so non-creators never
   stream bytes).
 
+## Video Captions (Cloudflare Stream)
+- No local table — Cloudflare Stream is the sole source of truth for which caption
+  tracks exist on a video (same philosophy as `thumbnail_url`/`duration_seconds`
+  being synced FROM Cloudflare rather than owned here). The public player already
+  embeds Cloudflare's own iframe (`iframe.cloudflarestream.com/{uid}`), which shows
+  a native CC toggle automatically once tracks exist — no custom player work needed.
+- `GET/POST /api/upload/video/:videoId/captions`, `DELETE .../captions/:language` —
+  creator-only, ownership-checked against `videos.creator_id`
+- Cloudflare's captions API only accepts WebVTT — `srtToVtt()` in zuva-api.js
+  losslessly converts `.srt` uploads (strips numeric cue-sequence lines, swaps the
+  comma decimal separator for VTT's required period) before the PUT; `.vtt` uploads
+  pass through unchanged
+- `CAPTION_LANGUAGES` whitelist (en/fr/pt/sw/ar/es/ht/yo/ha/zu/am) must stay in sync
+  with the matching list in `zuva-frontend/components/VideoUploadForm.tsx`
+
 ## Engagement Layer (likes / comments / subscriptions)
 - Tables: `video_likes`, `comments` (one-level replies via `parent_comment_id`; status
   visible/hidden/deleted), `subscriptions` — see `schema/migrations/2026-07-26-engagement.sql`

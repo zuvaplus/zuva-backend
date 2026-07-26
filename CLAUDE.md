@@ -162,6 +162,15 @@ cp .env.example .env   # fill in values
 npm run dev            # node --watch server.js
 ```
 
+## Creator Dashboard Support
+- `GET /api/creator/videos` — the authenticated creator's own videos, every status
+  (unlike `GET /api/channel/:username`, which only shows published ones)
+- `creator_links` table (title/url/position, max 10 enforced in the POST route) —
+  management-only for now (`GET/POST/PATCH/DELETE /api/creator/links`, reorder via
+  `PATCH /api/creator/links/reorder`); a future public read path will let the
+  watch-page links shelf render them once that ships
+- `PATCH /api/channel/update` now also accepts `avatar_url` (validated http(s) URL)
+
 ## Creator Application Lifecycle
 - `unconfirmed` → (emailed confirm link, `GET /api/creator-signup/confirm/:token`,
   renders a branded HTML page) → `pending` → admin approve/reject

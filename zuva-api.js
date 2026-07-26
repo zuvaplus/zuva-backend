@@ -1830,6 +1830,176 @@ router.get('/upload/status/:videoId',
   }
 );
 
+// ── GET /api/creator/videos ──────────────────────────────────
+// The authenticated creator's OWN videos, every status included (unlike
+// GET /api/channel/:username, which only ever shows published ones) —
+// this is what the creator dashboard's "My Videos" list uses.
+router.get('/creator/videos', requireAuth, requireCreator, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT id, creator_id, title, description, category, tags,
+             cloudflare_video_id, thumbnail_url, duration_seconds, status,
+             view_count, COALESCE(like_count, 0) AS like_count,
+             COALESCE(comment_count, 0) AS comment_count, created_at
+      FROM videos
+      WHERE creator_id = $1
+      ORDER BY created_at DESC
+    `, [req.user.id]);
+    res.json({ success: true, videos: rows });
+  } catch (err) {
+    console.error('creator videos fetch error:', err.message);
+    res.status(500).json({ error: 'Could not fetch your videos' });
+  }
+});
+
+// ── Creator links (title + URL "shelf" — management only for now;
+//    the future watch-page links shelf will read these once it ships) ──
+const MAX_CREATOR_LINKS = 10;
+
+router.get('/creator/links', requireAuth, requireCreator, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, title, url, position FROM creator_links
+       WHERE creator_id = $1 ORDER BY position ASC, created_at ASC`,
+      [req.user.id]
+    );
+    res.json({ success: true, links: rows });
+  } catch (err) {
+    console.error('creator links fetch error:', err.message);
+    res.status(500).json({ error: 'Could not fetch links' });
+  }
+});
+
+router.post('/creator/links',
+  requireAuth,
+  requireCreator,
+  [
+    body('title').trim().notEmpty().isLength({ max: 100 }).withMessage('Title is required (max 100 characters)'),
+    body('url').trim().isURL({ protocols: ['http', 'https'], require_protocol: true })
+      .isLength({ max: 500 }).withMessage('A valid http(s) URL is required'),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows: countRows } = await db.query(
+        'SELECT COUNT(*)::int AS count FROM creator_links WHERE creator_id = $1',
+        [req.user.id]
+      );
+      if (countRows[0].count >= MAX_CREATOR_LINKS) {
+        return res.status(400).json({ error: `You can add up to ${MAX_CREATOR_LINKS} links` });
+      }
+
+      const { rows } = await db.query(`
+        INSERT INTO creator_links (creator_id, title, url, position)
+        VALUES ($1, $2, $3, COALESCE(
+          (SELECT MAX(position) + 1 FROM creator_links WHERE creator_id = $1), 0
+        ))
+        RETURNING id, title, url, position
+      `, [req.user.id, req.body.title, req.body.url]);
+
+      res.status(201).json({ success: true, link: rows[0] });
+    } catch (err) {
+      console.error('creator link create error:', err.message);
+      res.status(500).json({ error: 'Could not add link' });
+    }
+  }
+);
+
+// Reorder must be declared BEFORE the /:id routes below — otherwise
+// Express would match "reorder" as the :id segment first.
+router.patch('/creator/links/reorder',
+  requireAuth,
+  requireCreator,
+  [
+    body('orderedIds').isArray({ min: 1 }).withMessage('orderedIds must be a non-empty array'),
+    body('orderedIds.*').isUUID().withMessage('orderedIds must contain valid link IDs'),
+  ],
+  validate,
+  async (req, res) => {
+    const orderedIds = req.body.orderedIds;
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+
+      const { rows: owned } = await client.query(
+        'SELECT id FROM creator_links WHERE creator_id = $1 FOR UPDATE',
+        [req.user.id]
+      );
+      const ownedIds = new Set(owned.map((r) => r.id));
+      const sameSet =
+        orderedIds.length === ownedIds.size && orderedIds.every((id) => ownedIds.has(id));
+      if (!sameSet) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'orderedIds must match your existing links exactly' });
+      }
+
+      for (let i = 0; i < orderedIds.length; i++) {
+        await client.query(
+          'UPDATE creator_links SET position = $1 WHERE id = $2 AND creator_id = $3',
+          [i, orderedIds[i], req.user.id]
+        );
+      }
+
+      await client.query('COMMIT');
+      res.json({ success: true });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('creator links reorder error:', err.message);
+      res.status(500).json({ error: 'Could not reorder links' });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.patch('/creator/links/:id',
+  requireAuth,
+  requireCreator,
+  [
+    param('id').isUUID().withMessage('Invalid link ID'),
+    body('title').optional().trim().notEmpty().isLength({ max: 100 }).withMessage('Title must be 1-100 characters'),
+    body('url').optional().trim().isURL({ protocols: ['http', 'https'], require_protocol: true })
+      .isLength({ max: 500 }).withMessage('A valid http(s) URL is required'),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        UPDATE creator_links
+        SET title = COALESCE($1, title), url = COALESCE($2, url)
+        WHERE id = $3 AND creator_id = $4
+        RETURNING id, title, url, position
+      `, [req.body.title ?? null, req.body.url ?? null, req.params.id, req.user.id]);
+
+      if (!rows.length) return res.status(404).json({ error: 'Link not found' });
+      res.json({ success: true, link: rows[0] });
+    } catch (err) {
+      console.error('creator link update error:', err.message);
+      res.status(500).json({ error: 'Could not update link' });
+    }
+  }
+);
+
+router.delete('/creator/links/:id',
+  requireAuth,
+  requireCreator,
+  [param('id').isUUID().withMessage('Invalid link ID')],
+  validate,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(
+        'DELETE FROM creator_links WHERE id = $1 AND creator_id = $2 RETURNING id',
+        [req.params.id, req.user.id]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'Link not found' });
+      res.json({ success: true });
+    } catch (err) {
+      console.error('creator link delete error:', err.message);
+      res.status(500).json({ error: 'Could not delete link' });
+    }
+  }
+);
+
 // ── GET /api/channel/:username ───────────────────────────────
 router.get('/channel/:username',
   [param('username').trim().notEmpty()],
@@ -1868,19 +2038,23 @@ router.patch('/channel/update',
     body('display_name').optional().trim().isLength({ min: 1, max: 100 }).withMessage('display_name must be 1-100 characters'),
     body('bio').optional().trim().isLength({ max: 500 }).withMessage('bio must be at most 500 characters'),
     body('country_code').optional().trim().isLength({ min: 2, max: 2 }).withMessage('country_code must be a 2-letter ISO code'),
+    body('avatar_url').optional().trim()
+      .isURL({ protocols: ['http', 'https'], require_protocol: true })
+      .isLength({ max: 500 }).withMessage('avatar_url must be a valid http(s) URL'),
   ],
   validate,
   async (req, res) => {
-    const { display_name, bio, country_code } = req.body;
+    const { display_name, bio, country_code, avatar_url } = req.body;
     try {
       const { rows } = await db.query(`
         UPDATE users
         SET display_name = COALESCE($1, display_name),
             bio           = COALESCE($2, bio),
-            country_code  = COALESCE($3, country_code)
-        WHERE id = $4
+            country_code  = COALESCE($3, country_code),
+            avatar_url    = COALESCE($4, avatar_url)
+        WHERE id = $5
         RETURNING id, username, display_name, bio, country_code, avatar_url, role
-      `, [display_name ?? null, bio ?? null, country_code ?? null, req.user.id]);
+      `, [display_name ?? null, bio ?? null, country_code ?? null, avatar_url ?? null, req.user.id]);
 
       res.json({ success: true, user: rows[0] });
     } catch (err) {

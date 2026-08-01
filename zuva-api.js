@@ -1600,26 +1600,42 @@ router.get('/creator-signup/confirm/:token',
 //    view_count           INTEGER NOT NULL DEFAULT 0,
 //    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //  );
-//  -- If this table predates AWS Rekognition moderation / report-triggered
-//  -- review, add 'flagged' and 'under_review' to the existing status
-//  -- CHECK constraint (see moderateVideo() / moderateReportedVideo() below).
+//  -- If this table predates report-triggered review, add 'flagged' and
+//  -- 'under_review' to the existing status CHECK constraint (see
+//  -- moderateReportedVideo() below).
 //
 //  CREATE TABLE video_reports (
-//    id                SERIAL PRIMARY KEY,
-//    video_id          UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-//    reason            TEXT NOT NULL,
-//    reporter_clerk_id TEXT,
-//    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//    id                  SERIAL PRIMARY KEY,
+//    video_id            UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+//    reporter_id         UUID REFERENCES users(id) ON DELETE SET NULL,
+//    category            TEXT NOT NULL CHECK (category IN (
+//                           'nudity', 'minors', 'violence', 'animal_cruelty',
+//                           'hate_speech', 'misinformation', 'spam', 'copyright', 'other'
+//                         )),
+//    additional_details  TEXT,
+//    resolved_at         TIMESTAMPTZ,
+//    resolution          TEXT CHECK (resolution IN ('restored', 'removed')),
+//    -- Legacy columns kept for historical rows, no longer written to:
+//    reason              TEXT,
+//    reporter_clerk_id   TEXT,
+//    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //  );
 //
-//  NOTE: moderateVideo() (upload-time) only ever sets 'published' or
-//  'rejected' automatically. moderateReportedVideo() (report-triggered,
-//  see POST /video/:id/report) sets 'under_review' when the report count
-//  crosses REPORT_THRESHOLD, then 'published' or 'rejected' once AI
-//  re-review completes — or leaves it at 'under_review' if that re-review
-//  itself fails, for manual follow-up. 'flagged' is still not produced by
+//  NOTE: all new uploads publish immediately (status = 'published' at
+//  insert, see POST /upload/video) — there is no pre-approval gate.
+//  Moderation is entirely post-publish and report-driven:
+//  computeReportTier() (see POST /video/:id/report) sets 'under_review'
+//  once a category's pending-report count crosses its tier threshold
+//  (1 for nudity/minors, 2 for violence/animal_cruelty, REPORT_THRESHOLD
+//  for hate_speech/misinformation/spam/other). Only the lowest tier also
+//  triggers moderateReportedVideo()'s AI re-review; the two higher-
+//  severity tiers hide the video and alert admins immediately instead,
+//  deliberately without an automated re-publish path. An admin resolves
+//  the case via POST /api/admin/reports/:id/resolve ('restored' ->
+//  'published', 'removed' -> 'rejected', and increments the creator's
+//  users.violation_count on removal). 'flagged' is still not produced by
 //  any automated path — reserved for future use (e.g. manual admin
-//  flagging). See GET /admin/moderation-queue.
+//  flagging). See GET /admin/moderation-queue and GET /api/admin/reports.
 // ============================================================
 
 const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'Lifestyle', 'Education', 'Other'];
@@ -1635,42 +1651,16 @@ const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'L
 // asynchronously (see the NOTE there).
 const FLARE_MAX_DURATION_SECONDS = 90;
 
-// ── Content moderation: AWS Rekognition (thumbnail-based first pass) ──
-// Rekognition's video moderation API (StartContentModeration) requires the
-// video to already live in S3, which Cloudflare Stream doesn't give us.
-// As a workaround, this runs Rekognition's synchronous IMAGE moderation
-// (DetectModerationLabels) against the video's Cloudflare Stream thumbnail:
-//   - labels found at/above MinConfidence 75 -> status = 'rejected'
-//   - no labels found                        -> status = 'published'
-// This is a weak signal — a single frame can't vouch for an entire video —
-// but per product decision a clean thumbnail is treated as sufficient for
-// auto-publish. Never throws: any failure (thumbnail not ready yet, AWS
-// error, etc.) is caught and leaves the video at its current 'pending'
-// status rather than crashing the upload request.
-async function moderateVideo(cloudflareVideoId) {
-  try {
-    const thumbnailUrl = `https://videodelivery.net/${cloudflareVideoId}/thumbnails/thumbnail.jpg`;
-    const imageRes = await axios.get(thumbnailUrl, { responseType: 'arraybuffer', timeout: 15000 });
-    const imageBytes = Buffer.from(imageRes.data);
-
-    const result = await rekognition.send(new DetectModerationLabelsCommand({
-      Image: { Bytes: imageBytes },
-      MinConfidence: 75,
-    }));
-    const labels = result.ModerationLabels || [];
-
-    if (labels.length > 0) {
-      await db.query(`UPDATE videos SET status = 'rejected' WHERE cloudflare_video_id = $1`, [cloudflareVideoId]);
-      return { safe: false, labels };
-    }
-
-    await db.query(`UPDATE videos SET status = 'published' WHERE cloudflare_video_id = $1`, [cloudflareVideoId]);
-    return { safe: true };
-  } catch (err) {
-    console.error('moderateVideo error (video stays pending):', err.response?.data ?? err.message);
-    return { safe: null, error: err.message };
-  }
-}
+// ── Content moderation: post-publish only ─────────────────────
+// There used to be an upload-time AWS Rekognition thumbnail check here
+// (moderateVideo(), a synchronous gate that could reject a video or
+// strand it at 'pending' on a transient AWS/thumbnail failure). Removed —
+// per product decision, all new uploads publish immediately
+// (see POST /upload/video) and moderation is entirely post-publish,
+// driven by the tiered reporting system (computeReportTier(),
+// POST /video/:id/report). The Rekognition client is still used by
+// moderateReportedVideo() below, for the lowest-severity report tier
+// only (hate_speech/misinformation/spam/other) — see its own comment.
 
 // ── POST /api/upload/video ───────────────────────────────────
 // Identity comes from the x-clerk-user-id header (requireClerkUser), same
@@ -1752,34 +1742,25 @@ router.post('/upload/video',
       // Custom thumbnail uploads aren't wired up yet (no image storage is
       // configured in this backend) — Cloudflare's auto-generated thumbnail
       // is used regardless of what the frontend's optional thumbnail field sends.
+      //
+      // status = 'published' directly, no pre-approval gate — there used to
+      // be an upload-time AWS Rekognition thumbnail check here
+      // (moderateVideo(), now removed) that could reject or strand a video
+      // at 'pending'. Moderation is now entirely post-publish, driven by
+      // the tiered reporting system below (see computeReportTier() and
+      // POST /video/:id/report) rather than a synchronous gate on every upload.
       const { rows } = await db.query(`
         INSERT INTO videos
-          (creator_id, title, description, category, content_category, tags, cloudflare_video_id, thumbnail_url, duration_seconds, is_flare, contains_synthetic_media)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          (creator_id, title, description, category, content_category, tags, cloudflare_video_id, thumbnail_url, duration_seconds, is_flare, contains_synthetic_media, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'published')
         RETURNING *
       `, [
         req.user.id, title, description || null, category, contentCategory, tags,
         cf.uid, cf.thumbnail || null, durationSeconds, isFlare, containsSyntheticMedia,
       ]);
 
-      let video = rows[0];
-
-      // Run moderation before responding so the client gets the true final
-      // status immediately rather than a stale 'pending'. moderateVideo()
-      // never throws — on failure the video simply stays 'pending'.
-      const moderation = await moderateVideo(cf.uid);
-      let message;
-      if (moderation.safe === true) {
-        video = { ...video, status: 'published' };
-        message = 'Video uploaded successfully and is now live.';
-      } else if (moderation.safe === false) {
-        video = { ...video, status: 'rejected' };
-        message = 'Video uploaded but did not pass content moderation and has been rejected.';
-      } else {
-        message = 'Video uploaded successfully and is pending review.';
-      }
-
-      res.status(201).json({ success: true, video, moderation, message });
+      const video = rows[0];
+      res.status(201).json({ success: true, video, message: 'Video uploaded successfully and is now live.' });
     } catch (err) {
       console.error('video upload error:', err.response?.data ?? err.message);
       res.status(500).json({ error: 'Could not upload video' });
@@ -2854,25 +2835,57 @@ router.delete('/creator/:id/subscribe',
   }
 );
 
-// ── Report-triggered AI re-review ─────────────────────────────
-// Number of reports a video needs before it's auto-hidden ('under_review')
-// and sent back through AWS Rekognition. Read once at startup — restart
-// the process to pick up a changed REPORT_THRESHOLD.
+// ── Tiered reporting ───────────────────────────────────────────
+// Reports are self-selected into one of nine plain-language categories
+// by the reporter. 'copyright' never reaches this tier logic at all —
+// see the route below, which intercepts it before any DB write.
+const REPORT_CATEGORIES = [
+  'nudity', 'minors', 'violence', 'animal_cruelty', 'hate_speech',
+  'misinformation', 'spam', 'copyright', 'other',
+];
+
+// Number of *pending* (unresolved) reports the lowest-severity tier
+// needs before a video is auto-hidden and sent back through AWS
+// Rekognition. Read once at startup — restart the process to pick up a
+// changed REPORT_THRESHOLD.
 const REPORT_THRESHOLD = parseInt(process.env.REPORT_THRESHOLD, 10) || 3;
 
-// Re-runs the same thumbnail-based Rekognition check as moderateVideo()
-// (see the NOTE there on why this only checks the thumbnail, not the full
-// video), but for an already-published video that just crossed the report
-// threshold. Always emails the admin with the outcome. Never throws —
-// covers its own DB/Rekognition/email failures so the caller (the report
-// route, which does not await this) can't be broken by it.
+// Each category belongs to exactly one severity tier. Thresholds count
+// only *pending* reports (resolved_at IS NULL) in that tier's categories
+// for the video being reported — once an admin resolves a case, those
+// reports stop counting, so a video that was reviewed and restored isn't
+// permanently primed to re-trigger from stale history.
+//
+// The two higher-severity tiers hide the video and alert admins for
+// immediate human review, deliberately WITHOUT triggering the automated
+// Rekognition re-review — a wrongly-cleared AI re-scan auto-republishing
+// a nudity/minors or violence/animal_cruelty report would be dangerous
+// for exactly the categories where speed-to-human-eyes matters most.
+// Only the lowest tier (the pre-existing behavior) keeps the AI re-check.
+const REPORT_TIERS = [
+  { categories: ['nudity', 'minors'], threshold: 1, triggersAiReview: false },
+  { categories: ['violence', 'animal_cruelty'], threshold: 2, triggersAiReview: false },
+  { categories: ['hate_speech', 'misinformation', 'spam', 'other'], threshold: REPORT_THRESHOLD, triggersAiReview: true },
+];
+
+function reportTierForCategory(category) {
+  return REPORT_TIERS.find((tier) => tier.categories.includes(category)) ?? null;
+}
+
+// Re-runs the same thumbnail-based Rekognition check the old upload-time
+// moderateVideo() used to (removed — see the NOTE above the videos
+// CREATE TABLE comment), but for an already-published video that just
+// crossed the lowest report tier's threshold. Always emails the admin
+// with the outcome. Never throws — covers its own DB/Rekognition/email
+// failures so the caller (the report route, which does not await this)
+// can't be broken by it.
 async function moderateReportedVideo(videoId, cloudflareVideoId) {
   let videoInfo;
   try {
     const { rows } = await db.query(`
       SELECT v.title,
              COALESCE(u.display_name, u.username, 'Unknown') AS creator_name,
-             (SELECT COUNT(*)::int FROM video_reports vr WHERE vr.video_id = v.id) AS report_count
+             (SELECT COUNT(*)::int FROM video_reports vr WHERE vr.video_id = v.id AND vr.resolved_at IS NULL) AS pending_report_count
       FROM videos v
       LEFT JOIN users u ON u.id = v.creator_id
       WHERE v.id = $1
@@ -2888,7 +2901,7 @@ async function moderateReportedVideo(videoId, cloudflareVideoId) {
     <ul>
       <li><strong>Title:</strong> ${escapeHtml(videoInfo.title)}</li>
       <li><strong>Creator:</strong> ${escapeHtml(videoInfo.creator_name)}</li>
-      <li><strong>Report count:</strong> ${videoInfo.report_count}</li>
+      <li><strong>Pending reports:</strong> ${videoInfo.pending_report_count}</li>
   `;
 
   try {
@@ -2927,46 +2940,89 @@ async function moderateReportedVideo(videoId, cloudflareVideoId) {
   }
 }
 
-// ── POST /api/video/:id/report ───────────────────────────────
-const VALID_REPORT_REASONS = ['Inappropriate content', 'Copyright violation', 'Spam', 'Other'];
+// Matches the frontend's terms/page.tsx LEGAL_CONTACT constant — not
+// sourced from an env var, same as that page's hardcoded value.
+const LEGAL_CONTACT_EMAIL = 'legal@zuva.tv';
 
+// ── POST /api/video/:id/report ───────────────────────────────
 router.post('/video/:id/report',
   optionalAuth,
   [
     param('id').isUUID().withMessage('Invalid video ID'),
-    body('reason').isIn(VALID_REPORT_REASONS).withMessage('Invalid report reason'),
+    body('category').isIn(REPORT_CATEGORIES).withMessage('Invalid report category'),
+    body('additional_details').optional().trim().isLength({ max: 1000 }).withMessage('Details must be at most 1000 characters'),
   ],
   validate,
   async (req, res) => {
+    // Copyright isn't handled through the report pipeline — no
+    // video_reports row is written for it. Point the reporter at the
+    // existing takedown-notice process instead (see terms/page.tsx
+    // section 13, "or to submit a copyright takedown notice").
+    if (req.body.category === 'copyright') {
+      return res.json({
+        success: true,
+        redirect: 'copyright_process',
+        contactEmail: LEGAL_CONTACT_EMAIL,
+        message: `Copyright issues are handled through our takedown notice process, not this form. Please email ${LEGAL_CONTACT_EMAIL} with the details.`,
+      });
+    }
+
     try {
-      const videoCheck = await db.query('SELECT id, cloudflare_video_id FROM videos WHERE id = $1', [req.params.id]);
-      if (!videoCheck.rows.length) return res.status(404).json({ error: 'Video not found' });
-      const video = videoCheck.rows[0];
-
-      await db.query(
-        'INSERT INTO video_reports (video_id, reason, reporter_clerk_id) VALUES ($1, $2, $3)',
-        [req.params.id, req.body.reason, req.clerkUserId || null]
-      );
-
-      const { rows: countRows } = await db.query(
-        'SELECT COUNT(*)::int AS count FROM video_reports WHERE video_id = $1',
+      const videoCheck = await db.query(
+        'SELECT id, cloudflare_video_id, title FROM videos WHERE id = $1',
         [req.params.id]
       );
-      const reportCount = countRows[0].count;
-      const thresholdReached = reportCount >= REPORT_THRESHOLD;
+      if (!videoCheck.rows.length) return res.status(404).json({ error: 'Video not found' });
+      const video = videoCheck.rows[0];
+      const category = req.body.category;
+
+      await db.query(
+        'INSERT INTO video_reports (video_id, reporter_id, category, additional_details) VALUES ($1, $2, $3, $4)',
+        [video.id, req.user?.id || null, category, req.body.additional_details || null]
+      );
+
+      const tier = reportTierForCategory(category);
+      const { rows: countRows } = await db.query(
+        `SELECT COUNT(*)::int AS count FROM video_reports
+         WHERE video_id = $1 AND category = ANY($2::text[]) AND resolved_at IS NULL`,
+        [video.id, tier.categories]
+      );
+      const tierPendingCount = countRows[0].count;
+      const thresholdReached = tierPendingCount >= tier.threshold;
 
       if (thresholdReached) {
         await db.query(`UPDATE videos SET status = 'under_review' WHERE id = $1`, [video.id]);
-        // Not awaited — moderateReportedVideo does its own thumbnail fetch,
-        // AWS call, and email send, none of which the reporting user should
-        // have to wait on. It has full internal error handling and never
-        // throws, but .catch() here is a defensive backstop.
-        moderateReportedVideo(video.id, video.cloudflare_video_id).catch((err) => {
-          console.error('moderateReportedVideo unexpected error:', err.message);
-        });
+
+        if (tier.triggersAiReview) {
+          // Not awaited — moderateReportedVideo does its own thumbnail
+          // fetch, AWS call, and email send, none of which the reporting
+          // user should have to wait on. It has full internal error
+          // handling and never throws, but .catch() here is a defensive
+          // backstop.
+          moderateReportedVideo(video.id, video.cloudflare_video_id).catch((err) => {
+            console.error('moderateReportedVideo unexpected error:', err.message);
+          });
+        } else {
+          // High-severity tiers — hide immediately, alert admins for
+          // priority human review, no automated re-review/re-publish path.
+          sendAdminEmail(
+            'PRIORITY: Video Hidden — Needs Immediate Review',
+            `<p>A video was automatically hidden after reaching the report threshold for a high-severity category.</p>
+             <ul>
+               <li><strong>Title:</strong> ${escapeHtml(video.title)}</li>
+               <li><strong>Category:</strong> ${escapeHtml(category)}</li>
+               <li><strong>Pending reports in this category group:</strong> ${tierPendingCount}</li>
+             </ul>`
+          ).catch((err) => console.error('priority report email failed:', err.message));
+        }
       }
 
-      res.status(201).json({ success: true, report_count: reportCount, threshold_reached: thresholdReached });
+      res.status(201).json({
+        success: true,
+        category,
+        tier_pending_count: tierPendingCount,
+        threshold_reached: thresholdReached,
+      });
     } catch (err) {
       console.error('video report error:', err.message);
       res.status(500).json({ error: 'Could not submit report' });
@@ -3292,6 +3348,188 @@ router.get('/admin/moderation-queue', requireAdmin, async (req, res) => {
     res.status(500).json({ error: 'Could not fetch moderation queue' });
   }
 });
+
+// ── GET /api/admin/reports ───────────────────────────────────
+// Paginated report queue — the primary interface for the tiered
+// reporting system (see REPORT_TIERS / POST /video/:id/report above).
+// Distinct from GET /admin/moderation-queue (video-centric, shows
+// videos currently under_review) — this is report-centric, showing
+// individual report rows so admins can work a specific category's
+// backlog and see reporter-supplied details.
+router.get('/admin/reports',
+  requireAdmin,
+  [
+    query('category').optional().isIn(REPORT_CATEGORIES).withMessage('Invalid category'),
+    query('status').optional().isIn(['pending', 'resolved']).withMessage('status must be pending or resolved'),
+    query('page').optional().isInt({ min: 1 }).toInt(),
+    query('limit').optional().isInt({ min: 1, max: 50 }).toInt(),
+  ],
+  validate,
+  async (req, res) => {
+    const page   = req.query.page || 1;
+    const limit  = req.query.limit || 20;
+    const offset = (page - 1) * limit;
+    const status   = req.query.status || 'pending';
+    const category = req.query.category || null;
+
+    try {
+      const { rows } = await db.query(`
+        SELECT vr.id, vr.video_id, vr.category, vr.additional_details, vr.created_at,
+               vr.resolved_at, vr.resolution,
+               v.title AS video_title, v.status AS video_status, v.thumbnail_url,
+               v.creator_id, COALESCE(cu.display_name, cu.username, 'Unknown') AS creator_name,
+               vr.reporter_id, COALESCE(ru.display_name, ru.username) AS reporter_name
+        FROM video_reports vr
+        JOIN videos v ON v.id = vr.video_id
+        LEFT JOIN users cu ON cu.id = v.creator_id
+        LEFT JOIN users ru ON ru.id = vr.reporter_id
+        WHERE ($3::text IS NULL OR vr.category = $3)
+          AND (
+            ($4 = 'pending'  AND vr.resolved_at IS NULL)
+            OR ($4 = 'resolved' AND vr.resolved_at IS NOT NULL)
+          )
+        ORDER BY vr.created_at DESC
+        LIMIT $1 OFFSET $2
+      `, [limit + 1, offset, category, status]);
+
+      const hasMore = rows.length > limit;
+      res.json({ success: true, reports: rows.slice(0, limit), page, limit, has_more: hasMore });
+    } catch (err) {
+      console.error('admin reports fetch error:', err.message);
+      res.status(500).json({ error: 'Could not fetch reports' });
+    }
+  }
+);
+
+// ── GET /api/admin/reports/stats ─────────────────────────────
+// Defaults to the last 30 days if from/to aren't given. Category counts
+// are scoped by when the report was *filed* (created_at); resolution
+// time and the restored/removed ratio are scoped by when it was
+// *resolved* (resolved_at) — a report filed just before the range but
+// resolved inside it still counts toward resolution stats, not category
+// volume, which is the more intuitive read for each respectively.
+router.get('/admin/reports/stats',
+  requireAdmin,
+  [
+    query('from').optional().isISO8601().withMessage('from must be an ISO date'),
+    query('to').optional().isISO8601().withMessage('to must be an ISO date'),
+  ],
+  validate,
+  async (req, res) => {
+    const to   = req.query.to   ? new Date(req.query.to)   : new Date();
+    const from = req.query.from ? new Date(req.query.from) : new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    try {
+      const { rows: byCategory } = await db.query(`
+        SELECT category, COUNT(*)::int AS count
+        FROM video_reports
+        WHERE created_at BETWEEN $1 AND $2
+        GROUP BY category
+        ORDER BY count DESC
+      `, [from, to]);
+
+      const { rows: resolutionRows } = await db.query(`
+        SELECT
+          COUNT(*)::int AS resolved_count,
+          COUNT(*) FILTER (WHERE resolution = 'restored')::int AS restored_count,
+          COUNT(*) FILTER (WHERE resolution = 'removed')::int  AS removed_count,
+          AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)))::float AS avg_resolution_seconds
+        FROM video_reports
+        WHERE resolved_at IS NOT NULL AND resolved_at BETWEEN $1 AND $2
+      `, [from, to]);
+
+      res.json({
+        success: true,
+        range: { from: from.toISOString(), to: to.toISOString() },
+        by_category: byCategory,
+        resolved_count: resolutionRows[0].resolved_count,
+        restored_count: resolutionRows[0].restored_count,
+        removed_count: resolutionRows[0].removed_count,
+        avg_resolution_seconds: resolutionRows[0].avg_resolution_seconds,
+      });
+    } catch (err) {
+      console.error('admin reports stats error:', err.message);
+      res.status(500).json({ error: 'Could not fetch report stats' });
+    }
+  }
+);
+
+// ── POST /api/admin/reports/:id/resolve ──────────────────────
+// Resolving one report closes out every still-pending report against
+// the same video — an admin reviewing a case is deciding the video's
+// fate, not adjudicating each report row individually (multiple people
+// may have reported the same video for the same or different reasons).
+// 'removed' -> videos.status = 'rejected' (the existing terminal hidden
+// state) and increments the creator's users.violation_count for
+// repeat-violation tracking (feeds a future enforcement ladder — see the
+// migration's NOTE; no such ladder exists yet to act on the count).
+// 'restored' -> videos.status = 'published'.
+router.post('/admin/reports/:id/resolve',
+  requireAdmin,
+  [
+    param('id').isInt().withMessage('Invalid report ID'),
+    body('resolution').isIn(['restored', 'removed']).withMessage('resolution must be restored or removed'),
+  ],
+  validate,
+  async (req, res) => {
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+
+      const { rows: reportRows } = await client.query(
+        'SELECT video_id FROM video_reports WHERE id = $1',
+        [req.params.id]
+      );
+      if (!reportRows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Report not found' });
+      }
+      const videoId = reportRows[0].video_id;
+      const resolution = req.body.resolution;
+
+      const { rows: closedReports } = await client.query(
+        `UPDATE video_reports
+         SET resolved_at = NOW(), resolution = $2
+         WHERE video_id = $1 AND resolved_at IS NULL
+         RETURNING id`,
+        [videoId, resolution]
+      );
+
+      const newStatus = resolution === 'removed' ? 'rejected' : 'published';
+      const { rows: videoRows } = await client.query(
+        `UPDATE videos SET status = $2 WHERE id = $1 RETURNING id, creator_id`,
+        [videoId, newStatus]
+      );
+      if (!videoRows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Video not found' });
+      }
+      const video = videoRows[0];
+
+      if (resolution === 'removed') {
+        await client.query(
+          'UPDATE users SET violation_count = violation_count + 1 WHERE id = $1',
+          [video.creator_id]
+        );
+      }
+
+      await client.query('COMMIT');
+      res.json({
+        success: true,
+        video_id: videoId,
+        new_status: newStatus,
+        resolution,
+        reports_closed: closedReports.length,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('admin report resolve error:', err.message);
+      res.status(500).json({ error: 'Could not resolve report' });
+    } finally {
+      client.release();
+    }
+  }
+);
 
 // ── GET /api/admin/comments ──────────────────────────────────
 // Recent comments across all videos (newest first, capped at 100) so

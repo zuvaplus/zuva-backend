@@ -269,6 +269,68 @@ npm run dev            # node --watch server.js
   added to the `GET /api/feed` / `GET /api/flares/feed` response shapes, since
   nothing renders it there
 
+## Publishing & tiered reporting (moderation)
+- **All new uploads publish immediately** — `POST /api/upload/video` inserts
+  `videos.status = 'published'` directly. There is no pre-approval gate of any
+  kind. The old upload-time AWS Rekognition thumbnail check (`moderateVideo()`)
+  was removed entirely, not just bypassed — it could reject a video or strand
+  it at `'pending'` on a transient AWS/thumbnail failure, which in practice
+  behaved like an unintentional manual-approval requirement. Moderation is now
+  entirely post-publish, driven by reports
+- `videos.status` (not `moderation_status` — that name only exists in dead
+  legacy code referencing tables that were never real) already had
+  `'under_review'` in its CHECK constraint before this change; the migration
+  reasserts it defensively anyway for a clean positive confirmation
+- **`video_reports`** — widened from its original shape (`reason` free text,
+  `reporter_clerk_id`) rather than replaced: `reporter_id` (→ `users.id`,
+  nullable), `category` (9-value enum — see `REPORT_CATEGORIES`),
+  `additional_details`, `resolved_at`, `resolution` (`'restored'|'removed'`).
+  `reason`/`reporter_clerk_id` stay in place for historical rows but nothing
+  writes to them anymore; `reason`'s `NOT NULL` was relaxed so new inserts can
+  omit it. `id` stays `SERIAL` (not migrated to UUID — changing a live PK's
+  type is disproportionate risk for this table)
+- **Severity tiers** (`REPORT_TIERS` in zuva-api.js) — each category belongs to
+  exactly one tier, thresholds count only *pending* (`resolved_at IS NULL`)
+  reports in that tier's categories for the video being reported (so a
+  resolved-and-restored video isn't permanently primed to re-trigger from
+  stale history):
+  - `nudity`, `minors` → 1 pending report → `under_review`, priority admin email
+  - `violence`, `animal_cruelty` → 2 pending reports → same
+  - `hate_speech`, `misinformation`, `spam`, `other` → `REPORT_THRESHOLD`
+    (existing, default 3) pending reports → `under_review` **and** triggers
+    `moderateReportedVideo()`'s AI re-review, same as before
+  - The two higher-severity tiers deliberately do **not** trigger the AI
+    re-review — a wrongly-cleared Rekognition re-scan auto-republishing a
+    nudity/minors or violence/animal_cruelty report would be dangerous for
+    exactly the categories where speed-to-human-eyes matters most. They hide
+    the video and email the admin immediately instead, with no automated
+    re-publish path
+  - `copyright` never reaches tier logic or `video_reports` at all —
+    `POST /video/:id/report` intercepts it and returns a response pointing at
+    the existing takedown-notice process (`legal@zuva.tv`, matching
+    `terms/page.tsx`'s `LEGAL_CONTACT`) instead
+- **`GET /api/admin/reports?category=&status=&page=&limit=`** — report-centric
+  paginated queue (status defaults to `pending`), distinct from the older
+  `GET /admin/moderation-queue` (video-centric, unpaginated, shows videos
+  currently `under_review`/`flagged`) which is untouched
+- **`GET /api/admin/reports/stats?from=&to=`** — defaults to the last 30 days.
+  Category counts are scoped by `created_at` (when filed); resolution time and
+  the restored/removed ratio are scoped by `resolved_at` (when resolved) —
+  deliberately different date columns per stat, since a report filed just
+  before the range but resolved inside it should count toward resolution
+  stats, not category volume
+- **`POST /api/admin/reports/:id/resolve`** (`:id` is the `video_reports`
+  integer id, not a UUID) — resolving *one* report closes out **every**
+  still-pending report against the same video in one transaction (an admin is
+  deciding the video's fate, not adjudicating each report row — multiple
+  people may have reported the same video). `'removed'` → `videos.status =
+  'rejected'` + `users.violation_count += 1` for the creator. `'restored'` →
+  `videos.status = 'published'`
+- `users.violation_count` only accumulates right now — no Community
+  Guidelines page or enforcement ladder exists anywhere in either repo to act
+  on it yet (confirmed by search before writing this). The migration and this
+  route only build the counter itself, ready to feed a ladder later
+
 ## Flares (short-form vertical feed)
 - Same `videos` table/Cloudflare Stream pipeline as long-form uploads — `is_flare`
   boolean flags which feed a row belongs to; the main `/feed` browse grid and

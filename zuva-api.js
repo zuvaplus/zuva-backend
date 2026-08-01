@@ -29,6 +29,8 @@ const { randomUUID: uuidv4 } = require('crypto');
 const { body, param, query, validationResult } = require('express-validator');
 const { RekognitionClient, DetectModerationLabelsCommand } = require('@aws-sdk/client-rekognition');
 const nodemailer = require('nodemailer');
+const countries = require('i18n-iso-countries');
+countries.registerLocale(require('i18n-iso-countries/langs/en.json'));
 require('dotenv').config();
 
 const router = express.Router();
@@ -3666,6 +3668,359 @@ router.delete('/admin/users/:id',
   }
 );
 
+
+// ============================================================
+//  ADMIN ANALYTICS
+// ============================================================
+//  Three read-only dashboards. All admin-only (requireAdmin — the same
+//  x-admin-email-header guard as every other /api/admin/* route in this
+//  file; see the NOTE above requireAdmin's definition about it being a
+//  temporary, spoofable check).
+//
+//  Column-name assumptions surfaced against watch_events/tips/video_likes/
+//  comments (per request, flagging before writing rather than guessing):
+//   - watch_events' duration column is `watched_seconds`, not
+//     `watch_duration_seconds` — that name doesn't exist anywhere in the
+//     schema (see the 2026-07-26-feed-ranking.sql migration).
+//   - tips' amount column is `amount_suns`, not `amount`.
+//   - The "likes" table is actually named `video_likes` (2026-07-26-
+//     engagement.sql), not `likes`.
+//   - watch_events has ONE ROW PER ~10-15s PROGRESS PING OR PAUSE/UNLOAD
+//     (see that migration's own comment), not one row per view. So
+//     `total_views` everywhere below (COUNT of watch_events rows,
+//     exactly as specified for the countries route) measures ping/
+//     engagement volume, not unique views — it will run higher than,
+//     and isn't period-filterable in the same way as, videos.view_count
+//     (a separate lifetime counter incremented once per view-complete
+//     event at line ~2474, which the spec's period-filtering requirement
+//     made unusable here since it carries no per-increment timestamp).
+//     Same caveat applies to the creators route's total_views, which had
+//     no explicit formula in the spec — it mirrors the countries route's
+//     definition for consistency.
+//   - tips.created_at is assumed to exist (every other transactional
+//     table in this schema has one, and period-filtering requires it)
+//     but no pre-existing query in this file reads that column, so it
+//     hasn't been directly verified against the live DB the way the
+//     other assumptions above were (those are confirmed by existing
+//     queries elsewhere in this file).
+//   - total_suns_earned (creators route) sums tips.amount_suns, which is
+//     the GROSS amount tipped to the creator, not their net post-split
+//     take — the actual creator_share_pct/platform_share_pct split
+//     happens at tip time and only the running total lands on
+//     wallets.total_earned_suns (lifetime, not period-filterable, not
+//     per-tip). This will read higher than what the creator actually
+//     received in Suns.
+//   - Rows with no country_code set (never populated at signup) are
+//     excluded from country grouping in both the countries and creators
+//     routes — there's no "unknown" bucket in the spec's shape.
+//   - total_users/new_users_this_period exclude soft-deleted users
+//     (deleted_at IS NOT NULL), matching the one other place in this
+//     file that filters on deleted_at (line ~2802).
+//   - creators route's video_count is period-filtered (videos created
+//     in the period), matching "All KPIs filtered by period except
+//     subscriber_count" — the spec didn't give it an explicit formula.
+//   - Country display names come from the i18n-iso-countries package
+//     (English) rather than a hardcoded map, per instruction — it covers
+//     the full ISO 3166-1 list, not just the 66-country COUNTRIES set
+//     the frontend's signup dropdown uses, since diaspora tippers (the
+//     whole point of suns_flow) can be anywhere.
+// ============================================================
+
+const ANALYTICS_PERIOD_DAYS = { '7d': 7, '30d': 30, all: null };
+
+// Returns a Date lower-bound for the period, or null for 'all' (no lower bound).
+function analyticsPeriodSince(period) {
+  const days = ANALYTICS_PERIOD_DAYS[period];
+  return days == null ? null : new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+}
+
+// Validates period by hand rather than express-validator + the shared
+// `validate` middleware (which returns 422 for every other route in this
+// file, by design — see the comment above its definition) because the
+// analytics spec explicitly asked for 400 on an invalid period.
+function requireValidPeriod(req, res, next) {
+  if (req.query.period !== undefined && !(req.query.period in ANALYTICS_PERIOD_DAYS)) {
+    return res.status(400).json({ error: 'period must be 7d, 30d, or all' });
+  }
+  next();
+}
+
+function countryDisplayName(code) {
+  if (!code) return null;
+  return countries.getName(code, 'en') || code;
+}
+
+// ── GET /api/admin/analytics/overview ────────────────────────
+router.get('/admin/analytics/overview',
+  requireAdmin,
+  requireValidPeriod,
+  async (req, res) => {
+    const period = req.query.period || '30d';
+    const since = analyticsPeriodSince(period);
+
+    try {
+      const { rows } = await db.query(`
+        SELECT
+          (SELECT COUNT(*)::int FROM users WHERE deleted_at IS NULL) AS total_users,
+          (SELECT COUNT(*)::int FROM users WHERE role = 'creator' AND deleted_at IS NULL) AS total_creators,
+          (SELECT COUNT(*)::int FROM videos) AS total_videos,
+          (SELECT COUNT(*)::int FROM videos WHERE is_flare = true) AS total_flares,
+          (SELECT COALESCE(SUM(watched_seconds), 0)::float / 3600
+             FROM watch_events
+             WHERE $1::timestamptz IS NULL OR created_at >= $1) AS total_watch_hours,
+          (SELECT COALESCE(SUM(balance_suns), 0)::int FROM wallets) AS suns_in_circulation,
+          (SELECT COALESCE(SUM(amount_suns), 0)::int
+             FROM tips
+             WHERE $1::timestamptz IS NULL OR created_at >= $1) AS suns_tipped_this_period,
+          (SELECT COUNT(*)::int FROM users
+             WHERE deleted_at IS NULL AND ($1::timestamptz IS NULL OR created_at >= $1)) AS new_users_this_period,
+          (SELECT COUNT(*)::int FROM videos
+             WHERE $1::timestamptz IS NULL OR created_at >= $1) AS new_videos_this_period
+      `, [since]);
+
+      const row = rows[0];
+      res.json({
+        total_users:              row.total_users,
+        total_creators:           row.total_creators,
+        total_videos:             row.total_videos,
+        total_flares:             row.total_flares,
+        total_watch_hours:        Math.round(row.total_watch_hours * 100) / 100,
+        suns_in_circulation:      row.suns_in_circulation,
+        suns_tipped_this_period:  row.suns_tipped_this_period,
+        new_users_this_period:    row.new_users_this_period,
+        new_videos_this_period:   row.new_videos_this_period,
+      });
+    } catch (err) {
+      console.error('admin analytics overview error:', err.message);
+      res.status(500).json({ error: 'Could not fetch analytics overview' });
+    }
+  }
+);
+
+// ── GET /api/admin/analytics/countries ───────────────────────
+router.get('/admin/analytics/countries',
+  requireAdmin,
+  requireValidPeriod,
+  async (req, res) => {
+    const period = req.query.period || '30d';
+    const since = analyticsPeriodSince(period);
+
+    try {
+      const { rows: byCountryRows } = await db.query(`
+        WITH viewer_stats AS (
+          SELECT u.country_code,
+                 COUNT(*)::int AS total_views,
+                 COALESCE(SUM(we.watched_seconds), 0)::int AS total_watch_seconds
+          FROM watch_events we
+          JOIN users u ON u.id = we.user_id
+          WHERE u.country_code IS NOT NULL
+            AND ($1::timestamptz IS NULL OR we.created_at >= $1)
+          GROUP BY u.country_code
+        ),
+        sent_stats AS (
+          SELECT u.country_code,
+                 COALESCE(SUM(t.amount_suns), 0)::int AS suns_sent
+          FROM tips t
+          JOIN users u ON u.id = t.sender_id
+          WHERE u.country_code IS NOT NULL
+            AND ($1::timestamptz IS NULL OR t.created_at >= $1)
+          GROUP BY u.country_code
+        ),
+        received_stats AS (
+          SELECT u.country_code,
+                 COALESCE(SUM(t.amount_suns), 0)::int AS suns_received
+          FROM tips t
+          JOIN users u ON u.id = t.creator_id
+          WHERE u.country_code IS NOT NULL
+            AND ($1::timestamptz IS NULL OR t.created_at >= $1)
+          GROUP BY u.country_code
+        )
+        SELECT
+          COALESCE(v.country_code, s.country_code, r.country_code) AS country_code,
+          COALESCE(v.total_views, 0) AS total_views,
+          COALESCE(v.total_watch_seconds, 0) AS total_watch_seconds,
+          COALESCE(s.suns_sent, 0) AS suns_sent,
+          COALESCE(r.suns_received, 0) AS suns_received
+        FROM viewer_stats v
+        FULL OUTER JOIN sent_stats s ON s.country_code = v.country_code
+        FULL OUTER JOIN received_stats r ON r.country_code = COALESCE(v.country_code, s.country_code)
+        ORDER BY total_views DESC
+      `, [since]);
+
+      const by_country = byCountryRows
+        .filter((r) => r.total_views > 0 || r.suns_sent > 0 || r.suns_received > 0)
+        .map((r) => ({
+          country_code: r.country_code,
+          country_name: countryDisplayName(r.country_code),
+          total_views: r.total_views,
+          total_watch_minutes: Math.round((r.total_watch_seconds / 60) * 100) / 100,
+          suns_sent: r.suns_sent,
+          suns_received: r.suns_received,
+        }));
+
+      const { rows: flowRows } = await db.query(`
+        SELECT
+          su.country_code AS from_country_code,
+          cu.country_code AS to_country_code,
+          COALESCE(SUM(t.amount_suns), 0)::int AS suns_total,
+          COUNT(*)::int AS tip_count
+        FROM tips t
+        JOIN users su ON su.id = t.sender_id
+        JOIN users cu ON cu.id = t.creator_id
+        WHERE su.country_code IS NOT NULL AND cu.country_code IS NOT NULL
+          AND su.country_code <> cu.country_code
+          AND ($1::timestamptz IS NULL OR t.created_at >= $1)
+        GROUP BY su.country_code, cu.country_code
+        ORDER BY suns_total DESC
+        LIMIT 50
+      `, [since]);
+
+      const suns_flow = flowRows.map((r) => ({
+        from_country_code: r.from_country_code,
+        from_country_name: countryDisplayName(r.from_country_code),
+        to_country_code: r.to_country_code,
+        to_country_name: countryDisplayName(r.to_country_code),
+        suns_total: r.suns_total,
+        tip_count: r.tip_count,
+      }));
+
+      const { rows: domesticRows } = await db.query(`
+        SELECT COALESCE(SUM(t.amount_suns), 0)::int AS domestic_tips_total
+        FROM tips t
+        JOIN users su ON su.id = t.sender_id
+        JOIN users cu ON cu.id = t.creator_id
+        WHERE su.country_code IS NOT NULL AND cu.country_code IS NOT NULL
+          AND su.country_code = cu.country_code
+          AND ($1::timestamptz IS NULL OR t.created_at >= $1)
+      `, [since]);
+
+      res.json({
+        by_country,
+        suns_flow,
+        domestic_tips_total: domesticRows[0].domestic_tips_total,
+      });
+    } catch (err) {
+      console.error('admin analytics countries error:', err.message);
+      res.status(500).json({ error: 'Could not fetch country analytics' });
+    }
+  }
+);
+
+// ── GET /api/admin/analytics/creators ────────────────────────
+const CREATOR_SORT_COLUMNS = {
+  views:      'total_views',
+  suns:       'total_suns_earned',
+  comments:   'total_comments',
+  likes:      'total_likes',
+  watch_time: 'total_watch_seconds',
+};
+
+router.get('/admin/analytics/creators',
+  requireAdmin,
+  requireValidPeriod,
+  [
+    query('sort').optional().isIn(Object.keys(CREATOR_SORT_COLUMNS)).withMessage('sort must be one of views, suns, comments, likes, watch_time'),
+    query('page').optional().isInt({ min: 1 }).toInt(),
+    query('limit').optional().isInt({ min: 1, max: 100 }).toInt(),
+  ],
+  validate,
+  async (req, res) => {
+    const period = req.query.period || '30d';
+    const since = analyticsPeriodSince(period);
+    const sortColumn = CREATOR_SORT_COLUMNS[req.query.sort || 'views'];
+    const page = req.query.page || 1;
+    const limit = req.query.limit || 20;
+    const offset = (page - 1) * limit;
+
+    try {
+      const { rows } = await db.query(`
+        WITH watch_stats AS (
+          SELECT v.creator_id,
+                 COUNT(we.id)::int AS total_views,
+                 COALESCE(SUM(we.watched_seconds), 0)::int AS total_watch_seconds
+          FROM videos v
+          JOIN watch_events we ON we.video_id = v.id
+          WHERE $1::timestamptz IS NULL OR we.created_at >= $1
+          GROUP BY v.creator_id
+        ),
+        tip_stats AS (
+          SELECT t.creator_id,
+                 COALESCE(SUM(t.amount_suns), 0)::int AS total_suns_earned
+          FROM tips t
+          WHERE $1::timestamptz IS NULL OR t.created_at >= $1
+          GROUP BY t.creator_id
+        ),
+        comment_stats AS (
+          SELECT v.creator_id,
+                 COUNT(c.id)::int AS total_comments
+          FROM videos v
+          JOIN comments c ON c.video_id = v.id AND c.status = 'visible'
+          WHERE $1::timestamptz IS NULL OR c.created_at >= $1
+          GROUP BY v.creator_id
+        ),
+        like_stats AS (
+          SELECT v.creator_id,
+                 COUNT(vl.id)::int AS total_likes
+          FROM videos v
+          JOIN video_likes vl ON vl.video_id = v.id
+          WHERE $1::timestamptz IS NULL OR vl.created_at >= $1
+          GROUP BY v.creator_id
+        ),
+        video_stats AS (
+          SELECT creator_id, COUNT(*)::int AS video_count
+          FROM videos
+          WHERE $1::timestamptz IS NULL OR created_at >= $1
+          GROUP BY creator_id
+        )
+        SELECT
+          u.id AS creator_id, u.username, u.display_name, u.country_code,
+          u.avatar_url, COALESCE(u.follower_count, 0) AS subscriber_count,
+          COALESCE(ws.total_views, 0) AS total_views,
+          COALESCE(ws.total_watch_seconds, 0) AS total_watch_seconds,
+          COALESCE(ts.total_suns_earned, 0) AS total_suns_earned,
+          COALESCE(cs.total_comments, 0) AS total_comments,
+          COALESCE(ls.total_likes, 0) AS total_likes,
+          COALESCE(vs.video_count, 0) AS video_count,
+          COUNT(*) OVER()::int AS total_count
+        FROM users u
+        LEFT JOIN watch_stats   ws ON ws.creator_id = u.id
+        LEFT JOIN tip_stats     ts ON ts.creator_id = u.id
+        LEFT JOIN comment_stats cs ON cs.creator_id = u.id
+        LEFT JOIN like_stats    ls ON ls.creator_id = u.id
+        LEFT JOIN video_stats   vs ON vs.creator_id = u.id
+        WHERE u.role = 'creator' AND u.deleted_at IS NULL
+        ORDER BY ${sortColumn} DESC, u.id ASC
+        LIMIT $2 OFFSET $3
+      `, [since, limit, offset]);
+
+      const creators = rows.map((r) => ({
+        creator_id: r.creator_id,
+        username: r.username,
+        display_name: r.display_name,
+        country_code: r.country_code,
+        country_name: countryDisplayName(r.country_code),
+        avatar_url: r.avatar_url,
+        total_views: r.total_views,
+        total_watch_minutes: Math.round((r.total_watch_seconds / 60) * 100) / 100,
+        total_suns_earned: r.total_suns_earned,
+        total_comments: r.total_comments,
+        total_likes: r.total_likes,
+        video_count: r.video_count,
+        subscriber_count: r.subscriber_count,
+      }));
+
+      res.json({
+        creators,
+        total: rows[0]?.total_count ?? 0,
+        page,
+        limit,
+      });
+    } catch (err) {
+      console.error('admin analytics creators error:', err.message);
+      res.status(500).json({ error: 'Could not fetch creator analytics' });
+    }
+  }
+);
 
 // ============================================================
 //  EXPORT

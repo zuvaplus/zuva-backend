@@ -1608,6 +1608,16 @@ router.get('/creator-signup/confirm/:token',
 //    id                  SERIAL PRIMARY KEY,
 //    video_id            UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
 //    reporter_id         UUID REFERENCES users(id) ON DELETE SET NULL,
+//    -- The migration adds this as TEXT + CHECK (matching every other
+//    -- categorical column in this schema, e.g. content_category) via
+//    -- ADD COLUMN IF NOT EXISTS — but on the live DB it turned out
+//    -- video_reports.category already existed as a genuine Postgres
+//    -- enum type with these exact 9 values, so the ADD COLUMN was a
+//    -- no-op and the CHECK below is redundant (harmless) with the
+//    -- enum's own restriction. Either representation behaves
+//    -- identically from the application's side — just noting it here
+//    -- so this comment doesn't mislead a future reader inspecting the
+//    -- real schema.
 //    category            TEXT NOT NULL CHECK (category IN (
 //                           'nudity', 'minors', 'violence', 'animal_cruelty',
 //                           'hate_speech', 'misinformation', 'spam', 'copyright', 'other'

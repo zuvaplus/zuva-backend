@@ -76,11 +76,16 @@ clause anywhere is built from user input (all are static or `$N`-parameterized).
 app.use(verifyJWT);  // sets req.user from Authorization: Bearer <token>
 ```
 
-### Admin Routes (Temporary Header Check)
-`/api/admin/*` routes (`requireAdmin` in `zuva-api.js`) check an `x-admin-email` header against
-`ADMIN_EMAIL`. This is spoofable by anyone who knows the admin's email — it exists to unblock the
-admin dashboard UI before real session verification is wired up. Replace with a real Clerk session
-check (e.g. `@clerk/backend`, verifying the caller's session token server-side) before production.
+### Admin Routes
+`/api/admin/*` routes are gated by `requireAdmin`, created in `server.js` (`src/middleware/
+requireAuth.js`) and exposed to `zuva-api.js` via an `app.get('requireAdmin')` bridge. It verifies
+the caller's Clerk JWT (same as `requireAuth`) and then checks the resolved `users` row has
+`role === 'admin'`. A `requireAdmin` function also exists directly in `zuva-api.js`, but it's just
+that bridge — there is no separate header-based implementation live anywhere.
+
+The older `x-admin-email`-header-against-`ADMIN_EMAIL` check this section used to describe is gone
+from the request path. Don't reintroduce header-based admin checks for new routes — use `requireAdmin`
+from `server.js`.
 
 ### Identity via x-clerk-user-id (Temporary, Same Caveat)
 `/api/user/role`, `/api/channel/update`, and `/api/upload/video` resolve the caller by looking up

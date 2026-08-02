@@ -3045,9 +3045,9 @@ router.post('/video/:id/report',
 
 // ============================================================
 //  ADMIN ROUTES
-//  All routes below require an x-admin-email header matching
-//  ADMIN_EMAIL (see the requireAdmin guard above for the caveat
-//  that this is a spoofable, temporary check).
+//  All routes below require requireAdmin (bridged from server.js —
+//  see the note above its definition): real Clerk JWT verification via
+//  requireAuth, then a role === 'admin' check against the users row.
 // ============================================================
 
 // ── GET /api/admin/applications ──────────────────────────────
@@ -3672,10 +3672,10 @@ router.delete('/admin/users/:id',
 // ============================================================
 //  ADMIN ANALYTICS
 // ============================================================
-//  Three read-only dashboards. All admin-only (requireAdmin — the same
-//  x-admin-email-header guard as every other /api/admin/* route in this
-//  file; see the NOTE above requireAdmin's definition about it being a
-//  temporary, spoofable check).
+//  Three read-only dashboards. All admin-only (requireAdmin — real Clerk
+//  JWT verification plus a role === 'admin' DB check, bridged from
+//  server.js; see the note above requireAdmin's definition in this
+//  file). Same guard as every other /api/admin/* route.
 //
 //  Column-name assumptions surfaced against watch_events/tips/video_likes/
 //  comments (per request, flagging before writing rather than guessing):

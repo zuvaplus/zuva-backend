@@ -10,6 +10,8 @@
  *   /api/suns/cashout        → purchaseLimiter  (cash out Suns)
  *   /api/suns/tip            → tipLimiter       (tip a creator)
  *   /api/suns/* (catch-all)  → sunsLimiter      (ledger + anything else)
+ *   /api/ads/serve           → adsServeLimiter    (ad-slot check before each video)
+ *   /api/ads/impression      → adsImpressionLimiter (ad-play confirmation — anti-fraud)
  *   /api/*      (global)     → apiLimiter       (everything else)
  *
  * Mount order in server.js matters: most-specific paths first.
@@ -100,6 +102,29 @@ const uploadLimiter = rateLimit({
   message: { error: 'Too many upload requests, please try again later.' },
 });
 
+// ── GET /api/ads/serve — ad-slot check before each video ──────
+// 60 requests per 1 minute. A viewer can watch many videos in one
+// session, each one calling this before playback starts.
+const adsServeLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many ad requests, please slow down.' },
+});
+
+// ── POST /api/ads/impression — ad-play confirmation ───────────
+// 10 requests per 1 minute. The tightest limiter in this file —
+// this is the one write path a client could hammer to fraudulently
+// inflate (or misreport) an advertiser's delivered impressions.
+const adsImpressionLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many impression requests, please slow down.' },
+});
+
 module.exports = {
   apiLimiter,
   walletLimiter,
@@ -109,4 +134,6 @@ module.exports = {
   sunsLimiter,
   uploadLimiter,
   commentLimiter,
+  adsServeLimiter,
+  adsImpressionLimiter,
 };

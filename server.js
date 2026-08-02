@@ -13,10 +13,13 @@ const {
   sunsLimiter,
   uploadLimiter,
   commentLimiter,
+  adsServeLimiter,
+  adsImpressionLimiter,
 } = require('./src/middleware/rateLimiter');
 const { Pool }       = require('pg');
 const { router: zuvaRoutes, pool: apiPool, writeDoubleEntry } = require('./zuva-api');
 const createPayoutWebhookRouter = require('./services/payouts/webhookRouter');
+const createAdsRouter = require('./routes/ads');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -78,7 +81,15 @@ app.use('/api/suns',          sunsLimiter);     //  20 req / 15 min
 app.use('/api/feed',          feedLimiter);     //  60 req / 1 min
 app.use('/api/wallet',        walletLimiter);   //  20 req / 15 min
 app.use('/api/upload',        uploadLimiter);   //  10 req / 1 hour
+app.use('/api/ads/serve',      adsServeLimiter);      //  60 req / 1 min
+app.use('/api/ads/impression', adsImpressionLimiter); //  10 req / 1 min
 app.use('/api',               apiLimiter, zuvaRoutes); // 100 req / 15 min (global)
+
+// Zuva Ads routes — mounted after the rate limiting middleware above
+// (both the ads-specific limiters and the global apiLimiter, which
+// also applies here since /api/ads/* falls under the /api prefix
+// zuvaRoutes didn't match and fell through from).
+app.use('/api/ads', createAdsRouter(apiPool));
 
 // ─── Health checks ────────────────────────────────────────────
 const healthBody = () => ({

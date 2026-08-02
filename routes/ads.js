@@ -399,7 +399,11 @@ module.exports = function createAdsRouter(pool) {
   router.get('/admin/campaigns', requireAdmin, async (req, res) => {
     try {
       const { rows } = await pool.query(
-        `SELECT c.*, a.business_name AS advertiser_business_name
+        `SELECT c.*, a.business_name AS advertiser_business_name,
+                EXISTS (
+                  SELECT 1 FROM ad_creatives cr
+                  WHERE cr.campaign_id = c.id AND cr.is_approved = true
+                ) AS has_approved_creative
          FROM ad_campaigns c
          JOIN advertisers a ON a.id = c.advertiser_id
          ORDER BY c.created_at DESC`
@@ -567,6 +571,27 @@ module.exports = function createAdsRouter(pool) {
       }
     }
   );
+
+  // ── GET /api/ads/admin/creatives ─────────────────────────────
+  router.get('/admin/creatives', requireAdmin, async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT cr.id, cr.label, cr.type, cr.file_url, cr.cloudflare_asset_id,
+                cr.duration_seconds, cr.click_through_url, cr.is_approved,
+                cr.is_active, cr.created_at,
+                c.id AS campaign_id, c.name AS campaign_name,
+                a.id AS advertiser_id, a.business_name AS advertiser_name
+         FROM ad_creatives cr
+         JOIN ad_campaigns c ON c.id = cr.campaign_id
+         JOIN advertisers a ON a.id = c.advertiser_id
+         ORDER BY cr.created_at DESC`
+      );
+      res.json({ success: true, creatives: rows });
+    } catch (err) {
+      console.error('ads/admin/creatives fetch error:', err.message);
+      res.status(500).json({ error: 'Could not fetch creatives' });
+    }
+  });
 
   // ── POST /api/ads/admin/creatives ────────────────────────────
   router.post('/admin/creatives',

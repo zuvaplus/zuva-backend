@@ -70,12 +70,6 @@ clause anywhere is built from user input (all are static or `$N`-parameterized).
 - **Development** (`NODE_ENV !== 'production'`): allows `localhost:3001`, `localhost:3000`
 - **Production**: allows `https://zuva.tv`, `https://www.zuva.tv`
 
-### Auth (Temporary Shim)
-`req.user` is hardcoded in `server.js`. Replace with JWT middleware before production:
-```js
-app.use(verifyJWT);  // sets req.user from Authorization: Bearer <token>
-```
-
 ### Admin Routes
 `/api/admin/*` routes are gated by `requireAdmin`, created in `server.js` (`src/middleware/
 requireAuth.js`) and exposed to `zuva-api.js` via an `app.get('requireAdmin')` bridge. It verifies

@@ -1314,14 +1314,13 @@ router.post('/feed/watch-progress',
 
 // ============================================================
 //  ROUTE: GET /api/user/role
-//  Looks up a user's role by their Clerk user ID, sent via the
-//  x-clerk-user-id header. Used by the frontend navbar/sidebar to
-//  pick between the viewer and creator navigation experience.
-//
-//  Requires a clerk_user_id column mapping Clerk identities to
-//  internal user rows. Run this migration if it doesn't exist yet:
-//    ALTER TABLE users ADD COLUMN IF NOT EXISTS clerk_user_id TEXT UNIQUE;
-//    CREATE INDEX IF NOT EXISTS users_clerk_user_id_idx ON users(clerk_user_id);
+//  Looks up the authenticated user's role. Identity comes from
+//  requireAuth (real Clerk JWT verification via @clerk/backend's
+//  verifyToken, bridged from server.js — see the note above
+//  requireAdmin's definition in this file), which resolves the users
+//  row by clerk_user_id and attaches it as req.user before this handler
+//  runs. Used by the frontend navbar/sidebar to pick between the viewer
+//  and creator navigation experience.
 // ============================================================
 router.get('/user/role', requireAuth, async (req, res) => {
   // id/username are included so the frontend can source its own DB user id
@@ -1675,10 +1674,13 @@ const FLARE_MAX_DURATION_SECONDS = 90;
 // only (hate_speech/misinformation/spam/other) — see its own comment.
 
 // ── POST /api/upload/video ───────────────────────────────────
-// Identity comes from the x-clerk-user-id header (requireClerkUser), same
-// as /api/channel/update — a client-supplied creator_id field is accepted
-// for compatibility but is checked against the authenticated user rather
-// than trusted, so a caller can't upload as someone else.
+// Identity comes from requireClerkUser, which just bridges to the same
+// real requireAuth/Clerk JWT verification used everywhere else (see the
+// note above requireAdmin's definition in this file) — not a header
+// read. Same as /api/channel/update — a client-supplied creator_id
+// field is accepted for compatibility but is checked against the
+// authenticated user rather than trusted, so a caller can't upload as
+// someone else.
 router.post('/upload/video',
   requireClerkUser,
   // Role gate BEFORE multer — a non-creator gets a clear 403 without the

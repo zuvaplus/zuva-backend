@@ -35,7 +35,7 @@ JWT_SECRET=your_jwt_secret
 NODE_ENV=production          # switches CORS to zuva.tv
 PORT=3000                    # Railway sets this automatically
 TURNSTILE_SECRET_KEY=your_turnstile_secret_key  # verifies /api/creator-signup submissions
-ADMIN_EMAIL=your_admin_email@zuva.tv            # gates /api/admin/* routes (see Auth note below)
+ADMIN_EMAIL=your_admin_email@zuva.tv            # sendAdminEmail() notification target only — does NOT gate /api/admin/* (see Admin Routes note below)
 CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
 CLOUDFLARE_API_TOKEN=your_cloudflare_stream_api_token  # /api/upload/video, /api/upload/status/:id
 AWS_ACCESS_KEY_ID=your_aws_access_key_id        # Rekognition content moderation (see below)
@@ -86,12 +86,6 @@ that bridge — there is no separate header-based implementation live anywhere.
 The older `x-admin-email`-header-against-`ADMIN_EMAIL` check this section used to describe is gone
 from the request path. Don't reintroduce header-based admin checks for new routes — use `requireAdmin`
 from `server.js`.
-
-### Identity via x-clerk-user-id (Temporary, Same Caveat)
-`/api/user/role`, `/api/channel/update`, and `/api/upload/video` resolve the caller by looking up
-`users.clerk_user_id` from an `x-clerk-user-id` header (`requireClerkUser` in `zuva-api.js`). Same
-spoofability caveat as the admin check above — replace with verified Clerk session tokens before
-production.
 
 ### Video Upload (Cloudflare Stream)
 `POST /api/upload/video` proxies the uploaded file (up to 2GB) through this server to Cloudflare

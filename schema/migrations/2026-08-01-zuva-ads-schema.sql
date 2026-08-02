@@ -41,22 +41,26 @@
 --      Zuva account.
 --
 --  Column-vocabulary note (flagging, not enforcing): ad_campaigns.
---  target_categories is a free TEXT[], but the example values given
---  for this migration ("food_beverage", "lifestyle") don't match
---  videos.content_category's actual vocabulary (entertainment, music,
---  comedy, drama_series, documentary, discussion_debate, interview,
---  lifestyle_culture, news, nature, other — see
---  2026-07-26-feed-ranking.sql / 2026-07-26-categories-and-ai-
---  disclosure.sql). "food_beverage"/"hair_beauty"/etc. are this
---  migration's own business_category vocabulary (what kind of
---  business the advertiser runs), not a content category. Similarly
---  target_cities/target_countries store free-text names ("Toronto",
---  "Canada"), not users.country_code's 2-letter ISO format. None of
---  this blocks the migration — target_categories/target_cities/
---  target_countries have no CHECK constraint, exactly as specified —
---  but whatever ad-matching logic gets built against these arrays
---  will need to reconcile both vocabulary gaps against the viewer/
---  content data it's matching against.
+--  target_categories is a free TEXT[] with no CHECK constraint, but
+--  valid values are meant to match videos.content_category's real
+--  vocabulary — the authoritative list is CONTENT_CATEGORIES in
+--  zuva-api.js (also mirrored in the CHECK constraints added by
+--  2026-07-26-feed-ranking.sql and 2026-07-26-categories-and-ai-
+--  disclosure.sql):
+--    entertainment, music, comedy, drama_series, documentary,
+--    discussion_debate, interview, lifestyle_culture, news, nature,
+--    other
+--  "hair_beauty"/"food_beverage"/etc. are a different vocabulary
+--  entirely — this migration's own business_category values on
+--  advertisers (what kind of business the advertiser runs), not a
+--  content category, and not valid here. Similarly target_cities/
+--  target_countries store free-text names ("Toronto", "Canada"), not
+--  users.country_code's 2-letter ISO format. None of this blocks the
+--  migration — target_categories/target_cities/target_countries have
+--  no CHECK constraint, exactly as specified — but whatever ad-
+--  matching logic gets built against these arrays will need to
+--  reconcile both vocabulary gaps against the viewer/content data
+--  it's matching against.
 -- =============================================================
 
 
@@ -220,26 +224,30 @@ ALTER TABLE ad_impressions ENABLE ROW LEVEL SECURITY;
 -- it's applied to reads too, since none of this data is public.
 
 -- ad_impressions: service role has full access via the same RLS-
--- bypass as above. On top of that, allow the `authenticated` Supabase
--- role to INSERT — this is the one exception, for a frontend impression-
--- tracking beacon that fires directly rather than through the Express
--- backend. NOTE: "their own impression records" (as specified) can't
+-- bypass as above. On top of that, allow both the `authenticated` and
+-- `anon` Supabase roles to INSERT — this is the one exception, for a
+-- frontend impression-tracking beacon that fires directly rather than
+-- through the Express backend. `anon` is included because the
+-- homepage and /feed are both browsable signed-out (see CLAUDE.md),
+-- so a signed-out viewer must still be able to fire an impression
+-- event. NOTE: "their own impression records" (as specified) can't
 -- actually be enforced by a WITH CHECK clause here, because this table
 -- deliberately has no user_id/viewer_id column to check auth.uid()
 -- against (see the table comment above) — viewer_session_id is an
--- anonymous string, not a Supabase Auth identity. So this policy
--- allows any authenticated caller to insert any impression row; it
--- cannot be scoped tighter than that without adding an identifying
--- column, which would undercut the anonymity this table is designed
--- for. Flagging rather than silently narrowing or widening the ask:
--- if signed-out/anonymous viewers (the homepage and /feed are both
--- browsable signed-out) also need to fire impressions, this policy
--- as written will reject them — let me know if an `anon` INSERT
--- policy should be added too.
+-- anonymous string, not a Supabase Auth identity. So these policies
+-- allow any caller (signed in or not) to insert any impression row;
+-- that can't be scoped tighter without adding an identifying column,
+-- which would undercut the anonymity this table is designed for.
 DROP POLICY IF EXISTS "ad_impressions_insert_authenticated" ON ad_impressions;
 CREATE POLICY "ad_impressions_insert_authenticated"
   ON ad_impressions FOR INSERT
   TO authenticated
+  WITH CHECK (true);
+
+DROP POLICY IF EXISTS "ad_impressions_insert_anon" ON ad_impressions;
+CREATE POLICY "ad_impressions_insert_anon"
+  ON ad_impressions FOR INSERT
+  TO anon
   WITH CHECK (true);
 
 
@@ -256,5 +264,5 @@ CREATE POLICY "ad_impressions_insert_authenticated"
 -- Expect 2 rows:
 --   SELECT tgname FROM pg_trigger WHERE tgname LIKE 'trg_advertisers%' OR tgname LIKE 'trg_ad_campaigns%';
 --
--- Expect 1 row:
+-- Expect 2 rows:
 --   SELECT policyname FROM pg_policies WHERE tablename = 'ad_impressions';

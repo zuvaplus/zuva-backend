@@ -57,6 +57,9 @@
 
 const express = require('express');
 const { body, param, query, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer');
+const Stripe = require('stripe');
 
 // Duplicated from zuva-api.js's CONTENT_CATEGORIES — see file header note.
 const CONTENT_CATEGORIES = [
@@ -68,6 +71,17 @@ const PACKAGE_TIERS = ['starter', 'growth', 'brand'];
 const MONTHLY_AMOUNT_USD_BY_TIER = { starter: 19, growth: 59, brand: 149 };
 // Midpoints of each tier's stated impressions range.
 const IMPRESSIONS_GOAL_BY_TIER = { starter: 6500, growth: 27500, brand: 80000 };
+
+// Same 9 values as the DB CHECK constraint on advertisers.business_category
+// (schema/migrations/2026-08-01-zuva-ads-schema.sql). The existing POST
+// /admin/advertisers route below only validates .notEmpty() on this field
+// and leans on the DB constraint to reject bad values — not modified here
+// (existing route), but these new /advertise/* routes validate against the
+// real list up front for a cleaner 422 instead of a DB-constraint 500.
+const BUSINESS_CATEGORIES = [
+  'food_beverage', 'hair_beauty', 'fashion_apparel', 'events_entertainment',
+  'professional_services', 'money_remittance', 'education', 'africa_based_brand', 'other',
+];
 
 // Duplicated from zuva-api.js's `validate` — same 422-with-errors-array shape.
 const validate = (req, res, next) => {
@@ -81,6 +95,140 @@ const validate = (req, res, next) => {
   }
   next();
 };
+
+// ============================================================
+//  /advertise page support — Nodemailer, Stripe, rate limiters
+// ============================================================
+//  AUDIT NOTES (this section's own "Part 1"):
+//
+//   1. FRONTEND_URL vs APP_URL — the task asked for a new FRONTEND_URL
+//      env var for building the Stripe success/cancel URLs, but
+//      zuva-api.js already has APP_URL serving exactly that purpose
+//      (with a `|| 'https://zuva.tv'` fallback — see its creator-signup
+//      confirmation-link usage). Reused APP_URL instead of introducing a
+//      second, differently-named env var for the same concept.
+//
+//   2. Nodemailer — duplicated (mailTransport, sendMail, escapeHtml,
+//      brandedEmailHtml) rather than imported from zuva-api.js, same
+//      reasoning as the CONTENT_CATEGORIES duplication above: zuva-api.js
+//      doesn't export these, and adding new exports there felt like
+//      modifying an existing file's surface for this task's purposes.
+//
+//   3. Stripe webhook raw body — the task assumed no raw-body handling
+//      exists yet and asked for a route-specific express.raw() mounted
+//      before the JSON middleware. One already exists, just not via
+//      express.raw(): server.js's global `express.json({ verify: (req,
+//      _res, buf) => { req.rawBody = buf; } })` captures the exact raw
+//      bytes of every request body before parsing — the same mechanism
+//      services/payouts/webhookRouter.js already relies on for its own
+//      signature checks. The webhook route below uses req.rawBody
+//      directly; no body-parsing middleware changes were needed anywhere.
+//
+//   4. Rate limiting — the original ads-routes task had explicit "mount
+//      in server.js" / "add to rateLimiter.js" instructions; this one
+//      doesn't, and "do not modify any existing pages, routes, or
+//      components" is stated as a hard constraint here. So the two new
+//      limiters below are defined locally and applied route-level,
+//      rather than centralized in src/middleware/rateLimiter.js.
+//
+//  Required environment variables:
+//    Backend:  STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
+//              STRIPE_PRICE_ID_STARTER, STRIPE_PRICE_ID_GROWTH,
+//              STRIPE_PRICE_ID_BRAND (APP_URL already exists — see note 1)
+//    Frontend: NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY (used only as a
+//              presence check to show/hide the card-payment option —
+//              Stripe Checkout is a hosted redirect, so the frontend
+//              never actually calls the Stripe SDK with this key)
+// ============================================================
+
+const APP_URL = process.env.APP_URL || 'https://zuva.tv';
+
+let mailTransport = null;
+if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+  mailTransport = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
+  });
+} else {
+  console.error('[ads/mail] GMAIL_USER / GMAIL_APP_PASSWORD not set — Zuva Ads emails will not be sent.');
+}
+
+// Never throws — a broken mail setup must not fail the request that
+// triggered it (same contract as zuva-api.js's sendAdminEmail/sendApplicantEmail).
+async function sendMail(to, subject, htmlBody) {
+  if (!mailTransport) {
+    console.error(`[ads/mail] Skipping email "${subject}" to ${to} — mail transport not configured.`);
+    return;
+  }
+  try {
+    await mailTransport.sendMail({ from: process.env.GMAIL_USER, to, subject, html: htmlBody });
+  } catch (err) {
+    console.error(`[ads/mail] Failed to send email "${subject}" to ${to}:`, err.message);
+  }
+}
+
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Same branded shell as zuva-api.js's brandedEmailHtml (duplicated — see
+// the audit note above). Callers must escapeHtml() any interpolated
+// user-supplied content themselves.
+function brandedEmailHtml({ heading, paragraphs, ctaText, ctaUrl }) {
+  const cta = ctaText && ctaUrl
+    ? `<tr><td style="padding:14px 0 6px;">
+         <a href="${ctaUrl}" style="display:inline-block;background:#f37b0d;color:#000000;font-weight:bold;font-size:14px;text-decoration:none;padding:13px 30px;border-radius:10px;">${ctaText}</a>
+       </td></tr>`
+    : '';
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#000000;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#000000;padding:36px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+             style="max-width:520px;background:#0d0d0d;border:1px solid rgba(243,123,13,0.3);border-radius:16px;padding:36px 32px;font-family:Arial,Helvetica,sans-serif;text-align:left;">
+        <tr><td style="color:#f37b0d;font-size:22px;font-weight:bold;padding-bottom:6px;">Zuva.tv ☀️</td></tr>
+        <tr><td style="color:#ffffff;font-size:19px;font-weight:bold;padding-bottom:14px;">${heading}</td></tr>
+        ${paragraphs.map((p) => `<tr><td style="color:#b3b3b3;font-size:14px;line-height:1.65;padding-bottom:12px;">${p}</td></tr>`).join('')}
+        ${cta}
+        <tr><td style="color:#555555;font-size:11px;line-height:1.5;padding-top:22px;border-top:1px solid rgba(255,255,255,0.06);">
+          Zuva.tv — African &amp; Caribbean streaming, powered by the Suns economy.<br/>
+          If this email wasn't meant for you, you can safely ignore it.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table></body></html>`;
+}
+
+// undefined (not a thrown error) when STRIPE_SECRET_KEY isn't set —
+// routes below check for this and return a clear 503 instead of
+// crashing the module at require time, mirroring mailTransport above.
+const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+const STRIPE_PRICE_ID_BY_TIER = {
+  starter: process.env.STRIPE_PRICE_ID_STARTER,
+  growth: process.env.STRIPE_PRICE_ID_GROWTH,
+  brand: process.env.STRIPE_PRICE_ID_BRAND,
+};
+
+const advertiseInquiryLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many inquiries, please try again later.' },
+});
+
+const advertiseCheckoutLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many checkout attempts, please try again later.' },
+});
 
 module.exports = function createAdsRouter(pool) {
   const router = express.Router();
@@ -785,6 +933,279 @@ module.exports = function createAdsRouter(pool) {
     } catch (err) {
       console.error('ads/admin/dashboard error:', err.message);
       res.status(500).json({ error: 'Could not fetch dashboard summary' });
+    }
+  });
+
+  // ============================================================
+  //  PUBLIC — POST /api/ads/advertise/inquiry
+  //  The /advertise page's "Get Payment Link" (mobile money / African
+  //  bank transfer) path. No Flutterwave API integration exists yet —
+  //  this creates a pending advertiser row and emails Dexter to send a
+  //  Flutterwave payment link by hand within 24h, exactly as specced.
+  // ============================================================
+  router.post('/advertise/inquiry',
+    advertiseInquiryLimiter,
+    [
+      body('business_name').trim().notEmpty().withMessage('business_name is required'),
+      body('contact_name').trim().notEmpty().withMessage('contact_name is required'),
+      body('email').trim().isEmail().withMessage('A valid email is required'),
+      body('phone').optional({ nullable: true }).isString(),
+      body('city').trim().notEmpty().withMessage('city is required'),
+      body('country').trim().notEmpty().withMessage('country is required'),
+      body('business_category').trim().isIn(BUSINESS_CATEGORIES).withMessage('Invalid business_category'),
+      body('package_tier').trim().isIn(PACKAGE_TIERS).withMessage('package_tier must be starter, growth, or brand'),
+      body('referral_source').optional({ nullable: true }).isString(),
+    ],
+    validate,
+    async (req, res) => {
+      const {
+        business_name: businessName, contact_name: contactName, email, phone,
+        city, country, business_category: businessCategory, package_tier: packageTier,
+        referral_source: referralSource,
+      } = req.body;
+
+      try {
+        await pool.query(
+          `INSERT INTO advertisers
+             (business_name, contact_name, email, phone, city, country,
+              business_category, package_tier, status, monthly_amount_usd, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10)`,
+          [
+            businessName, contactName, email, phone || null, city, country,
+            businessCategory, packageTier, MONTHLY_AMOUNT_USD_BY_TIER[packageTier],
+            // advertisers has no dedicated referral_source column — folded
+            // into notes rather than dropping data the form explicitly collected.
+            referralSource ? `Referral source: ${referralSource}` : null,
+          ]
+        );
+
+        const safeBusinessName = escapeHtml(businessName);
+        const safeContactName = escapeHtml(contactName);
+
+        sendMail(
+          'hello@zuva.tv',
+          'New Zuva Ads inquiry — payment link requested',
+          brandedEmailHtml({
+            heading: 'New Zuva Ads inquiry — payment link requested',
+            paragraphs: [
+              'Please send a Flutterwave payment link within 24 hours.',
+              `<strong>Business:</strong> ${safeBusinessName}<br/>` +
+              `<strong>Contact:</strong> ${safeContactName} (${escapeHtml(email)})<br/>` +
+              `<strong>Phone:</strong> ${escapeHtml(phone || 'Not provided')}<br/>` +
+              `<strong>Location:</strong> ${escapeHtml(city)}, ${escapeHtml(country)}<br/>` +
+              `<strong>Category:</strong> ${escapeHtml(businessCategory)}<br/>` +
+              `<strong>Package:</strong> ${escapeHtml(packageTier)} ($${MONTHLY_AMOUNT_USD_BY_TIER[packageTier]}/month)<br/>` +
+              `<strong>Referral source:</strong> ${escapeHtml(referralSource || 'Not provided')}`,
+            ],
+          })
+        );
+
+        sendMail(
+          email,
+          'Thank you for your interest in Zuva Ads',
+          brandedEmailHtml({
+            heading: `Thanks, ${safeContactName}!`,
+            paragraphs: [
+              `We have received your inquiry for the <strong>${escapeHtml(packageTier)}</strong> package and will send your payment link to this email within 24 hours.`,
+              'Questions? Reply to this email or contact <a href="mailto:hello@zuva.tv" style="color:#f37b0d;">hello@zuva.tv</a>.',
+            ],
+          })
+        );
+
+        res.json({ success: true, message: 'Inquiry received' });
+      } catch (err) {
+        if (err.code === '23505') {
+          return res.status(409).json({ error: 'An advertiser with this email already exists' });
+        }
+        console.error('ads/advertise/inquiry error:', err.message);
+        res.status(500).json({ error: 'Could not submit inquiry' });
+      }
+    }
+  );
+
+  // ============================================================
+  //  PUBLIC — POST /api/ads/advertise/stripe-checkout
+  //  The /advertise page's "Pay with Card" path. No advertiser row is
+  //  created here — only once the webhook below confirms payment.
+  //  Business details ride along as Checkout Session metadata.
+  // ============================================================
+  router.post('/advertise/stripe-checkout',
+    advertiseCheckoutLimiter,
+    [
+      body('business_name').trim().notEmpty().withMessage('business_name is required'),
+      body('contact_name').trim().notEmpty().withMessage('contact_name is required'),
+      body('email').trim().isEmail().withMessage('A valid email is required'),
+      body('phone').optional({ nullable: true }).isString(),
+      body('city').trim().notEmpty().withMessage('city is required'),
+      body('country').trim().notEmpty().withMessage('country is required'),
+      body('business_category').trim().isIn(BUSINESS_CATEGORIES).withMessage('Invalid business_category'),
+      body('package_tier').trim().isIn(PACKAGE_TIERS).withMessage('package_tier must be starter, growth, or brand'),
+      body('referral_source').optional({ nullable: true }).isString(),
+    ],
+    validate,
+    async (req, res) => {
+      if (!stripe) {
+        return res.status(503).json({ error: 'Card payments are not configured yet — use the payment-link option instead.' });
+      }
+
+      const {
+        business_name: businessName, contact_name: contactName, email, phone,
+        city, country, business_category: businessCategory, package_tier: packageTier,
+        referral_source: referralSource,
+      } = req.body;
+
+      const priceId = STRIPE_PRICE_ID_BY_TIER[packageTier];
+      if (!priceId) {
+        console.error(`ads/advertise/stripe-checkout: no STRIPE_PRICE_ID_* configured for tier "${packageTier}"`);
+        return res.status(503).json({ error: 'Card payments for this package are not configured yet — use the payment-link option instead.' });
+      }
+
+      try {
+        const customer = await stripe.customers.create({
+          email,
+          name: businessName,
+          phone: phone || undefined,
+        });
+
+        const session = await stripe.checkout.sessions.create({
+          mode: 'subscription',
+          customer: customer.id,
+          line_items: [{ price: priceId, quantity: 1 }],
+          success_url: `${APP_URL}/advertise/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${APP_URL}/advertise`,
+          metadata: {
+            business_name: businessName,
+            contact_name: contactName,
+            // Not in the task's literal metadata list, but phone has
+            // nowhere else to travel to the webhook below, and the
+            // advertisers.phone column would otherwise always end up
+            // null for every card-paying advertiser.
+            phone: phone || '',
+            city,
+            country,
+            business_category: businessCategory,
+            package_tier: packageTier,
+            referral_source: referralSource || '',
+          },
+        });
+
+        res.json({ url: session.url });
+      } catch (err) {
+        console.error('ads/advertise/stripe-checkout error:', err.message);
+        res.status(500).json({ error: 'Could not start checkout' });
+      }
+    }
+  );
+
+  // ============================================================
+  //  PUBLIC — POST /api/ads/advertise/webhook
+  //  Stripe webhook. checkout.session.completed activates the
+  //  advertiser; customer.subscription.deleted cancels them and their
+  //  active campaigns. See the audit note above this file's Nodemailer/
+  //  Stripe section for why no new raw-body middleware was needed.
+  // ============================================================
+  router.post('/advertise/webhook', async (req, res) => {
+    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+      console.error('ads/advertise/webhook: Stripe not configured');
+      return res.status(400).json({ error: 'Webhook not configured' });
+    }
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.rawBody,
+        req.headers['stripe-signature'],
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('ads/advertise/webhook signature verification failed:', err.message);
+      return res.status(400).json({ error: 'Invalid webhook signature' });
+    }
+
+    try {
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const meta = session.metadata || {};
+        const packageTier = meta.package_tier;
+        const monthlyAmountUsd = MONTHLY_AMOUNT_USD_BY_TIER[packageTier] ?? null;
+        const customerEmail = session.customer_details?.email || session.customer_email;
+
+        if (!customerEmail || !packageTier || !monthlyAmountUsd) {
+          console.error('ads/advertise/webhook: checkout.session.completed missing required metadata/email', {
+            sessionId: session.id, meta,
+          });
+        } else {
+          // Stripe documents webhook delivery as at-least-once, so a
+          // redelivered event must not 500 on advertisers.email's UNIQUE
+          // constraint — upsert to the same end state instead of a plain INSERT.
+          await pool.query(
+            `INSERT INTO advertisers
+               (business_name, contact_name, email, phone, city, country,
+                business_category, package_tier, status, stripe_customer_id, monthly_amount_usd)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9, $10)
+             ON CONFLICT (email) DO UPDATE SET
+               status = 'active',
+               stripe_customer_id = EXCLUDED.stripe_customer_id,
+               package_tier = EXCLUDED.package_tier,
+               monthly_amount_usd = EXCLUDED.monthly_amount_usd`,
+            [
+              meta.business_name || 'Unknown business', meta.contact_name || 'Unknown contact',
+              customerEmail, meta.phone || null, meta.city || null, meta.country || null,
+              meta.business_category || 'other', packageTier,
+              session.customer, monthlyAmountUsd,
+            ]
+          );
+
+          const safeBusinessName = escapeHtml(meta.business_name || 'your business');
+
+          sendMail(
+            customerEmail,
+            'Welcome to Zuva Ads — next steps',
+            brandedEmailHtml({
+              heading: 'Welcome to Zuva Ads!',
+              paragraphs: [
+                `Payment confirmed for <strong>${safeBusinessName}</strong>. Thank you for advertising with Zuva.`,
+                'You will receive a creative upload link within 24 hours. Your campaign goes live within 48 hours of creative approval.',
+                'Questions? Contact <a href="mailto:hello@zuva.tv" style="color:#f37b0d;">hello@zuva.tv</a>.',
+              ],
+            })
+          );
+
+          sendMail(
+            'hello@zuva.tv',
+            'New Zuva Ads subscriber',
+            brandedEmailHtml({
+              heading: 'New Zuva Ads subscriber',
+              paragraphs: [
+                `<strong>${safeBusinessName}</strong> — ${escapeHtml(packageTier)} — ${escapeHtml(meta.city || '')}, ${escapeHtml(meta.country || '')}.`,
+                'Check /admin to create their campaign.',
+              ],
+            })
+          );
+        }
+      } else if (event.type === 'customer.subscription.deleted') {
+        const subscription = event.data.object;
+        const { rows } = await pool.query(
+          `UPDATE advertisers SET status = 'cancelled' WHERE stripe_customer_id = $1 RETURNING id`,
+          [subscription.customer]
+        );
+        if (rows.length) {
+          await pool.query(
+            `UPDATE ad_campaigns SET status = 'cancelled' WHERE advertiser_id = $1 AND status = 'active'`,
+            [rows[0].id]
+          );
+        }
+      }
+
+      res.sendStatus(200);
+    } catch (err) {
+      console.error(`ads/advertise/webhook error handling ${event.type}:`, err.message);
+      // Deliberately NOT 200 here (task said 200 for handled events,
+      // 400 for signature failures — this is a third case it didn't
+      // cover): the signature already verified, so this is a transient
+      // processing failure (e.g. a DB hiccup). A 5xx makes Stripe retry
+      // with backoff instead of silently losing a payment confirmation.
+      res.status(500).json({ error: 'Webhook processing failed' });
     }
   });
 

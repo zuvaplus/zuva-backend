@@ -60,6 +60,7 @@ const { body, param, query, validationResult } = require('express-validator');
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const Stripe = require('stripe');
+const { randomUUID } = require('crypto');
 
 // Duplicated from zuva-api.js's CONTENT_CATEGORIES — see file header note.
 const CONTENT_CATEGORIES = [
@@ -1041,6 +1042,12 @@ module.exports = function createAdsRouter(pool) {
       body('business_category').trim().isIn(BUSINESS_CATEGORIES).withMessage('Invalid business_category'),
       body('package_tier').trim().isIn(PACKAGE_TIERS).withMessage('package_tier must be starter, growth, or brand'),
       body('referral_source').optional({ nullable: true }).isString(),
+      // Client-generated, reused across retries of the same checkout
+      // attempt (see AdvertisePaymentModal.tsx) — optional so older
+      // clients/direct API callers don't break; falls back to a
+      // server-generated key (with a warning) that loses retry
+      // protection for that one request but still degrades safely.
+      body('idempotency_key').optional({ nullable: true }).isString(),
     ],
     validate,
     async (req, res) => {
@@ -1051,7 +1058,7 @@ module.exports = function createAdsRouter(pool) {
       const {
         business_name: businessName, contact_name: contactName, email, phone,
         city, country, business_category: businessCategory, package_tier: packageTier,
-        referral_source: referralSource,
+        referral_source: referralSource, idempotency_key: idempotencyKey,
       } = req.body;
 
       const priceId = STRIPE_PRICE_ID_BY_TIER[packageTier];
@@ -1060,12 +1067,22 @@ module.exports = function createAdsRouter(pool) {
         return res.status(503).json({ error: 'Card payments for this package are not configured yet — use the payment-link option instead.' });
       }
 
+      let idKey = idempotencyKey;
+      if (!idKey) {
+        console.warn('ads/advertise/stripe-checkout: no idempotency_key from client — generating a server-side one (loses retry protection for this request)');
+        idKey = randomUUID();
+      }
+
       try {
+        // Two distinct derived keys, not one shared key — reusing the
+        // exact same idempotency key across two different Stripe API
+        // calls makes the second call fail with a "keys can only be
+        // used once, and the parameters do not match" error.
         const customer = await stripe.customers.create({
           email,
           name: businessName,
           phone: phone || undefined,
-        });
+        }, { idempotencyKey: `${idKey}-customer` });
 
         const session = await stripe.checkout.sessions.create({
           mode: 'subscription',
@@ -1087,7 +1104,7 @@ module.exports = function createAdsRouter(pool) {
             package_tier: packageTier,
             referral_source: referralSource || '',
           },
-        });
+        }, { idempotencyKey: `${idKey}-checkout` });
 
         res.json({ url: session.url });
       } catch (err) {
@@ -1141,18 +1158,20 @@ module.exports = function createAdsRouter(pool) {
           await pool.query(
             `INSERT INTO advertisers
                (business_name, contact_name, email, phone, city, country,
-                business_category, package_tier, status, stripe_customer_id, monthly_amount_usd)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9, $10)
+                business_category, package_tier, status, stripe_customer_id,
+                stripe_subscription_id, monthly_amount_usd)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9, $10, $11)
              ON CONFLICT (email) DO UPDATE SET
                status = 'active',
                stripe_customer_id = EXCLUDED.stripe_customer_id,
+               stripe_subscription_id = EXCLUDED.stripe_subscription_id,
                package_tier = EXCLUDED.package_tier,
                monthly_amount_usd = EXCLUDED.monthly_amount_usd`,
             [
               meta.business_name || 'Unknown business', meta.contact_name || 'Unknown contact',
               customerEmail, meta.phone || null, meta.city || null, meta.country || null,
               meta.business_category || 'other', packageTier,
-              session.customer, monthlyAmountUsd,
+              session.customer, session.subscription, monthlyAmountUsd,
             ]
           );
 
@@ -1193,6 +1212,67 @@ module.exports = function createAdsRouter(pool) {
           await pool.query(
             `UPDATE ad_campaigns SET status = 'cancelled' WHERE advertiser_id = $1 AND status = 'active'`,
             [rows[0].id]
+          );
+        }
+      } else if (event.type === 'invoice.payment_failed') {
+        // Notification-only, deliberately not auto-pausing the advertiser
+        // or their campaigns: Stripe already retries a failed renewal on
+        // its own schedule before eventually firing
+        // customer.subscription.deleted if every retry fails. Auto-pausing
+        // here (and resuming on a later invoice.payment_succeeded, which
+        // isn't handled either) would need to be built and tested as a
+        // pair to avoid leaving an advertiser stuck paused after their
+        // card issue resolves itself — safer for now to just make sure
+        // Dexter knows, and decide manually.
+        const invoice = event.data.object;
+        const { rows } = await pool.query(
+          `SELECT business_name, email FROM advertisers WHERE stripe_customer_id = $1`,
+          [invoice.customer]
+        );
+        const advertiser = rows[0];
+        sendMail(
+          'hello@zuva.tv',
+          'Zuva Ads payment failed',
+          brandedEmailHtml({
+            heading: 'A Zuva Ads renewal payment failed',
+            paragraphs: [
+              advertiser
+                ? `<strong>${escapeHtml(advertiser.business_name)}</strong> (${escapeHtml(advertiser.email)}) — Stripe will retry automatically. No action needed unless retries are exhausted (customer.subscription.deleted will fire then).`
+                : `Stripe customer ${escapeHtml(invoice.customer)} — no matching advertiser row found.`,
+            ],
+          })
+        );
+      } else if (event.type === 'customer.subscription.updated') {
+        // Only act on the specific false -> true transition, not every
+        // update (proration adjustments, Stripe metadata syncing, etc.
+        // all fire this same event type and would otherwise be noise).
+        const subscription = event.data.object;
+        const wasCancelling = event.data.previous_attributes?.cancel_at_period_end === false;
+        if (wasCancelling && subscription.cancel_at_period_end === true) {
+          const { rows } = await pool.query(
+            `SELECT business_name, email FROM advertisers WHERE stripe_customer_id = $1`,
+            [subscription.customer]
+          );
+          const advertiser = rows[0];
+          const periodEnd = subscription.current_period_end
+            ? new Date(subscription.current_period_end * 1000).toISOString().slice(0, 10)
+            : 'unknown date';
+          // Deliberately not changing advertisers.status here — the
+          // customer paid for the full period, so the campaign should
+          // keep running until it actually ends. No "cancelling soon"
+          // state exists in the status enum, and adding one is a schema
+          // change beyond what this fix covers.
+          sendMail(
+            'hello@zuva.tv',
+            'Zuva Ads subscription set to cancel',
+            brandedEmailHtml({
+              heading: 'A Zuva Ads subscription is cancelling at period end',
+              paragraphs: [
+                advertiser
+                  ? `<strong>${escapeHtml(advertiser.business_name)}</strong> (${escapeHtml(advertiser.email)}) — active until ${periodEnd}, then cancels automatically.`
+                  : `Stripe customer ${escapeHtml(subscription.customer)} — no matching advertiser row found. Active until ${periodEnd}.`,
+              ],
+            })
           );
         }
       }

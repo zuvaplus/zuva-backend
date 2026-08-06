@@ -20,6 +20,7 @@ const { Pool }       = require('pg');
 const { router: zuvaRoutes, pool: apiPool, writeDoubleEntry } = require('./zuva-api');
 const createPayoutWebhookRouter = require('./services/payouts/webhookRouter');
 const createAdsRouter = require('./routes/ads');
+const createStripeWebhookRouter = require('./routes/stripeWebhook');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -60,6 +61,20 @@ app.set('optionalAuth', optionalAuth);
 // events must never be throttled into a missed status update. Each
 // request is authenticated by the adapter's signature check instead.
 app.use('/api/webhooks/payouts', createPayoutWebhookRouter(apiPool, writeDoubleEntry));
+
+// ─── Stripe webhook (Suns purchases) ───────────────────────────
+// Was asked to be mounted BEFORE express.json() with its own
+// express.raw() parser, on the assumption that no raw-body handling
+// exists yet. It already does, just not via a route-specific parser:
+// express.json()'s own `verify` callback above captures req.rawBody
+// for every request before parsing, which is exactly what Stripe
+// signature verification needs — the same mechanism the payout
+// webhook above and routes/ads.js's own Stripe webhook already rely
+// on. So this is mounted AFTER express.json(), same as those two, and
+// uses req.rawBody directly — no new body-parsing middleware added.
+// Same before-every-rate-limiter positioning as the payout webhooks
+// above, for the same reason (a Stripe retry must never be throttled).
+app.use('/api/webhooks/stripe', createStripeWebhookRouter(apiPool, writeDoubleEntry));
 
 // ─── Routes ───────────────────────────────────────────────────
 // Specific-path limiters are mounted before the global catch-all

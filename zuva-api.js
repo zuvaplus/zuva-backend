@@ -25,15 +25,25 @@ const FormData   = require('form-data');
 const fs         = require('fs');
 const os         = require('os');
 const path       = require('path');
-const { randomUUID: uuidv4 } = require('crypto');
+const { randomUUID: uuidv4, createHash } = require('crypto');
 const { body, param, query, validationResult } = require('express-validator');
 const { RekognitionClient, DetectModerationLabelsCommand } = require('@aws-sdk/client-rekognition');
 const nodemailer = require('nodemailer');
 const countries = require('i18n-iso-countries');
 countries.registerLocale(require('i18n-iso-countries/langs/en.json'));
+const Stripe = require('stripe');
 require('dotenv').config();
 
 const router = express.Router();
+
+// ─── Stripe (Suns purchases) ────────────────────────────────────
+// undefined (not thrown) when STRIPE_SECRET_KEY isn't set — POST
+// /suns/purchase checks for this and returns a clear 503 instead of
+// crashing the module at require time. Same guarded-init pattern
+// routes/ads.js already uses for its own Stripe client (a separate
+// require('stripe')(...) call there — the SDK has no shared-instance
+// state to reuse across files).
+const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 // ─── Database pool ────────────────────────────────────────────
 if (!process.env.DATABASE_URL) {
@@ -365,19 +375,108 @@ router.get('/wallet/balance', requireAuth, async (req, res) => {
 
 
 // ============================================================
-//  ROUTE 2: POST /api/suns/purchase — TEMPORARILY DISABLED
-//  Chimoney (our pay-in provider) shut down in May 2026 and no
-//  replacement checkout provider has been selected yet. The route
-//  is kept so the frontend gets a clean, machine-readable 503
-//  instead of a 404; the sun_purchases table and its RLS policies
-//  are untouched, ready for the next provider.
+//  ROUTE 2: POST /api/suns/purchase
+//  Buyer purchases Suns with a card via Stripe Checkout (USD-only for
+//  v1 — see the note on FiatCurrency/getFiatToUsdRate's removal in
+//  git history; no FX-rate dependency needed this way). Mirrors the
+//  pre-Chimoney-removal flow's shape (create a pending sun_purchases
+//  row, return a checkout URL, credit Suns from the webhook once
+//  payment is confirmed) but the Stripe session is created FIRST so
+//  its real session id can go straight into the one INSERT below,
+//  instead of insert-then-update.
+//
+//  sun_purchases has no stripe_session_id/amount_suns/usd_amount/
+//  clerk_user_id columns — those names don't exist on the live table
+//  (confirmed via the pre-removal code, the only source of truth since
+//  this table predates the migration-file convention). Using the real
+//  columns instead: buyer_id (DB UUID, matching every other money
+//  route — tips/cashout/writeDoubleEntry all key off req.user.id, never
+//  a raw Clerk id), suns_purchased, fiat_amount/fiat_currency (fixed to
+//  'USD'), and chimoney_payment_id/chimoney_checkout_url repurposed to
+//  hold the Stripe session id/url — same "don't rename, just repurpose"
+//  precedent already used on ledger_entries.chimoney_payment_ref.
 // ============================================================
-router.post('/suns/purchase', requireAuth, (_req, res) => {
-  res.status(503).json({
-    error: 'Suns purchases are coming soon',
-    code:  'PURCHASES_NOT_LIVE',
-  });
-});
+router.post('/suns/purchase',
+  requireAuth,
+  [
+    body('amountSuns')
+      .isInt({ min: 50, max: 100000 })
+      .withMessage('Amount must be between 50 and 100,000 Suns'),
+  ],
+  validate,
+  async (req, res) => {
+    if (!stripe) {
+      return res.status(503).json({
+        error: 'Suns purchases are coming soon',
+        code:  'PURCHASES_NOT_LIVE',
+      });
+    }
+
+    const amountSuns = req.body.amountSuns;
+    const usdAmount = amountSuns / SUNS_PER_USD;
+    const buyerId = req.user.id;
+    const appUrl = process.env.APP_URL || 'https://zuva.tv';
+
+    try {
+      // No client-supplied idempotency key exists yet (the frontend
+      // isn't wired to this route — see the task this was built for),
+      // so this derives one from (buyer, amount, current minute) rather
+      // than a fresh UUID per call, which would give zero real retry
+      // protection. Once the frontend calls this directly, switching to
+      // a client-generated key reused across retries (the pattern
+      // routes/ads.js's Stripe checkout already uses) would be the
+      // more robust upgrade — flagging this as the interim approach.
+      const idempotencyKey = createHash('sha256')
+        .update(`suns-purchase:${buyerId}:${amountSuns}:${Math.floor(Date.now() / 60000)}`)
+        .digest('hex');
+
+      const metadata = {
+        clerk_user_id: req.clerkUserId || '',
+        amount_suns: String(amountSuns),
+        usd_amount: usdAmount.toFixed(2),
+        purchase_type: 'suns',
+      };
+
+      const session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        line_items: [{
+          price_data: {
+            currency: 'usd',
+            unit_amount: Math.round(usdAmount * 100), // cents
+            product_data: {
+              name: 'Zuva Suns',
+              description: `${amountSuns} Suns for your Zuva wallet`,
+            },
+          },
+          quantity: 1,
+        }],
+        success_url: `${appUrl}/wallet/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${appUrl}/wallet`,
+        customer_email: req.user.email,
+        metadata,
+        payment_intent_data: { metadata },
+      }, { idempotencyKey });
+
+      const purchaseId = uuidv4();
+      await db.query(`
+        INSERT INTO sun_purchases
+          (id, buyer_id, fiat_amount, fiat_currency, suns_purchased, fiat_to_usd_rate,
+           status, chimoney_payment_id, chimoney_checkout_url)
+        VALUES ($1, $2, $3, 'USD', $4, 1, 'pending', $5, $6)
+      `, [purchaseId, buyerId, usdAmount, amountSuns, session.id, session.url]);
+
+      res.json({
+        checkoutUrl:   session.url,
+        purchaseId,
+        sunsPurchased: amountSuns,
+        usdAmount:     usdAmount.toFixed(2),
+      });
+    } catch (err) {
+      console.error('suns purchase error:', err.message);
+      res.status(500).json({ error: 'Could not start purchase. Please try again.' });
+    }
+  }
+);
 
 
 // ============================================================

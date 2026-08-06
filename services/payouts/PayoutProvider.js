@@ -9,7 +9,7 @@
  *  on the creator's country and payout method; callers only ever talk
  *  to this interface.
  *
- *  Amounts are always in USD — 1000 Suns = $1. Currency conversion to
+ *  Amounts are always in USD — 100 Suns = $1. Currency conversion to
  *  the creator's local currency is the provider's job, not ours.
  * ============================================================
  */

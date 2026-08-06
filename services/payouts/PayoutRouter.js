@@ -96,7 +96,7 @@ function enforceMinimum(routeInfo, amountUSD) {
   if (amountUSD < routeInfo.minUSD) {
     throw new PayoutRoutingError(
       `Minimum payout for your region is $${routeInfo.minUSD} USD ` +
-      `(${routeInfo.minUSD * 1000} Suns); you requested $${amountUSD.toFixed(2)}.`
+      `(${routeInfo.minUSD * 100} Suns); you requested $${amountUSD.toFixed(2)}.`
     );
   }
 }
@@ -126,7 +126,7 @@ function optionsForCountry(countryCode) {
   const base = {
     provider:   adapter.name,
     minUSD,
-    minSuns:    minUSD * 1000, // 1000 Suns = $1
+    minSuns:    minUSD * 100, // 100 Suns = $1
     configured: adapter.isConfigured(),
   };
 

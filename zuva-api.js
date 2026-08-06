@@ -225,7 +225,7 @@ function srtToVtt(srtText) {
 }
 
 // ─── Constants ────────────────────────────────────────────────
-const SUNS_PER_USD        = 1000;  // 1000 Suns = $1.00 USD
+const SUNS_PER_USD        = 100; // 1 Sun = $0.01 USD
 const PLATFORM_WALLET_ID  = process.env.PLATFORM_WALLET_ID;
 
 // Minimum cashout is corridor-dependent — see MIN_PAYOUT_USD in
@@ -574,8 +574,8 @@ router.post('/suns/cashout',
   requireCreator,
   [
     body('amountSuns')
-      .isInt({ min: 1000 })
-      .withMessage('Cashout amount must be at least 1,000 Suns ($1 USD); regional minimums also apply'),
+      .isInt({ min: 100 })
+      .withMessage('Cashout amount must be at least 100 Suns ($1 USD); regional minimums also apply'),
     // Legacy network-suffixed channels are accepted and collapse to
     // 'mobile_money' — the corridor (creator country) decides the network.
     body('channel')
@@ -4041,7 +4041,7 @@ module.exports = { router, pool: db, writeDoubleEntry };
  * Then test with:
  *   POST /api/suns/purchase  { fiatAmount: 10, fiatCurrency: 'GBP' }
  *   POST /api/suns/tip       { creatorId: '...', amountSuns: 500 }
- *   POST /api/suns/cashout   { amountSuns: 1000, channel: 'mobile_money_mpesa', phoneNumber: '+254...', localCurrencyCode: 'KES' }
+ *   POST /api/suns/cashout   { amountSuns: 100, channel: 'mobile_money_mpesa', phoneNumber: '+254...', localCurrencyCode: 'KES' }
  *   GET  /api/wallet/balance
  *   GET  /api/suns/ledger
  */

@@ -2,7 +2,7 @@
 
 ## Overview
 Node.js 22 / Express 5 REST API for Zuva.TV — a tipping-economy streaming platform.
-Currency unit: **Suns** (1000 Suns = $1 USD). Payouts via regional provider adapters
+Currency unit: **Suns** (100 Suns = $1 USD). Payouts via regional provider adapters
 (Flutterwave live; Mukuru/WiPay/Wise stubbed) — see `services/payouts/`.
 
 ## Stack
@@ -394,7 +394,7 @@ npm run dev            # node --watch server.js
   global limiter, method+path scoped so GETs aren't throttled)
 
 ## Suns Economy Constants
-- `SUNS_PER_USD = 1000` (zuva-api.js)
+- `SUNS_PER_USD = 100` (zuva-api.js) — 1 Sun = $0.01 USD
 - Minimum cashout is per-corridor, in USD (`MIN_PAYOUT_USD` in `services/payouts/PayoutRouter.js`):
   $5 for Flutterwave and Mukuru corridors, $20 for WiPay and Wise corridors
 - FX conversion happens provider-side: payouts are initiated in USD and settled in

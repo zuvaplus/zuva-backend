@@ -65,7 +65,8 @@ const { randomUUID } = require('crypto');
 // Duplicated from zuva-api.js's CONTENT_CATEGORIES — see file header note.
 const CONTENT_CATEGORIES = [
   'entertainment', 'music', 'comedy', 'drama_series', 'documentary',
-  'discussion_debate', 'interview', 'lifestyle_culture', 'news', 'nature', 'other',
+  'discussion_debate', 'interview', 'lifestyle_culture', 'news', 'nature',
+  'sports', 'tech_innovation', 'science_education', 'health_wellness', 'other',
 ];
 
 const PACKAGE_TIERS = ['starter', 'growth', 'brand'];

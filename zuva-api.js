@@ -1055,22 +1055,31 @@ router.get('/creator/earnings/:creatorId',
 // for why these two fields coexist.
 const CONTENT_CATEGORIES = [
   'entertainment', 'music', 'comedy', 'drama_series', 'documentary',
-  'discussion_debate', 'interview', 'lifestyle_culture', 'news', 'nature', 'other',
+  'discussion_debate', 'interview', 'lifestyle_culture', 'news', 'nature',
+  'sports', 'tech_innovation', 'science_education', 'health_wellness', 'other',
 ];
 
-// The "Documentary & Discussion" umbrella — a code-level grouping only,
-// not a DB concept. Gets protected feed placement (the category floor,
-// below) and different score weighting: completion rate matters even
-// more, raw view count matters less.
-const DOC_DISCUSSION_CATEGORIES = ['documentary', 'discussion_debate', 'interview', 'lifestyle_culture'];
+// Categories that get protected feed placement (the floor, below) and
+// different score weighting: completion rate matters even more, raw
+// view count matters less — so genuinely informative/enriching content
+// doesn't get buried by pure engagement optimization. Originally just
+// the "Documentary & Discussion" umbrella (documentary, discussion_debate,
+// interview, lifestyle_culture); generalized under this broader name
+// when sports/tech_innovation/science_education/health_wellness were
+// added with the same protection as an explicit requirement. A
+// code-level grouping only, not a DB concept.
+const PROTECTED_CATEGORIES = [
+  'documentary', 'discussion_debate', 'interview', 'lifestyle_culture',
+  'sports', 'tech_innovation', 'science_education', 'health_wellness',
+];
 
 // Feed page composition. "Page" here means each successive window of
 // `limit` items in the assembled feed, not just the first one — see
 // buildRankedFeed, which assembles the whole ordered feed in rounds of
 // `limit` so the floors hold on every page a viewer scrolls to, not just
 // page one.
-const DOC_DISCUSSION_FLOOR_RATIO = 1 / 8;  // ~1 in 8 reserved for Documentary & Discussion
-const DIVERSITY_FLOOR_RATIO      = 1 / 6;  // a further slice reserved so one category can't dominate a page
+const PROTECTED_FLOOR_RATIO = 1 / 8;  // ~1 in 8 reserved for PROTECTED_CATEGORIES — same ratio as before the rename, unchanged
+const DIVERSITY_FLOOR_RATIO = 1 / 6;  // a further slice reserved so one category can't dominate a page
 
 // Gentle recency decay — long-form ages well, so this half-life is long
 // (a video this many days old has its recency contribution halved).
@@ -1082,13 +1091,13 @@ const FEED_RECENCY_HALF_LIFE_DAYS = 21;
 // which is expected of a linear heuristic score like this one.
 const FEED_WEIGHTS = {
   COMPLETION:                100,  // highest overall — the single strongest signal
-  COMPLETION_DOC_DISCUSSION:  150, // even more so for Documentary & Discussion
+  COMPLETION_PROTECTED:      150,  // even more so for PROTECTED_CATEGORIES
   TIPS:                       40,  // highest of the engagement-only signals — a Sun spent is the strongest signal
   COMMENTS:                   12,
-  COMMENTS_DOC_DISCUSSION:    24,  // comments signal engagement-with-ideas for this category specifically
+  COMMENTS_PROTECTED:         24,  // comments signal engagement-with-ideas for these categories specifically
   LIKES:                      10,
   VIEWS:                      10,
-  VIEWS_DOC_DISCUSSION:        2,  // de-emphasized — a high-completion, modest-view documentary should still win
+  VIEWS_PROTECTED:             2,  // de-emphasized — a high-completion, modest-view video in a protected category should still win
   RECENCY:                    10,
   COUNTRY_MATCH_BOOST:         6,  // small and additive, never a filter
 };
@@ -1104,19 +1113,19 @@ function clamp01(n) {
  * viewer: { preferred_country, preferred_languages } | null (anonymous/no prefs)
  */
 function computeFeedScore(video, viewer) {
-  const isDocDiscussion = DOC_DISCUSSION_CATEGORIES.includes(video.content_category);
+  const isProtected = PROTECTED_CATEGORIES.includes(video.content_category);
 
   const completion = clamp01((video.avg_completion_pct ?? 0) / 100);
-  const completionWeight = isDocDiscussion
-    ? FEED_WEIGHTS.COMPLETION_DOC_DISCUSSION
+  const completionWeight = isProtected
+    ? FEED_WEIGHTS.COMPLETION_PROTECTED
     : FEED_WEIGHTS.COMPLETION;
 
   const tipsScore    = Math.log10(1 + (video.tips_received ?? 0));
   const likesScore   = Math.log10(1 + (video.like_count ?? 0));
   const commentsScore = Math.log10(1 + (video.comment_count ?? 0));
-  const commentsWeight = isDocDiscussion ? FEED_WEIGHTS.COMMENTS_DOC_DISCUSSION : FEED_WEIGHTS.COMMENTS;
+  const commentsWeight = isProtected ? FEED_WEIGHTS.COMMENTS_PROTECTED : FEED_WEIGHTS.COMMENTS;
   const viewsScore   = Math.log10(1 + (video.view_count ?? 0));
-  const viewsWeight  = isDocDiscussion ? FEED_WEIGHTS.VIEWS_DOC_DISCUSSION : FEED_WEIGHTS.VIEWS;
+  const viewsWeight  = isProtected ? FEED_WEIGHTS.VIEWS_PROTECTED : FEED_WEIGHTS.VIEWS;
 
   const ageDays = Math.max(0, (Date.now() - new Date(video.created_at).getTime()) / 86400000);
   const recency = Math.pow(0.5, ageDays / FEED_RECENCY_HALF_LIFE_DAYS);
@@ -1143,19 +1152,19 @@ function computeFeedScore(video, viewer) {
 /**
  * assembleFeedRound
  * Builds one page-sized (`limit`) round out of the still-unused scored
- * candidates: first the Documentary & Discussion floor, then a general
+ * candidates: first the PROTECTED_CATEGORIES floor, then a general
  * diversity floor (a few slots reserved for categories not yet
  * represented in this round), then the rest filled by pure score. The
  * round is re-sorted by score at the end so the floor items don't read
  * as a visibly separate block bolted onto the page.
  */
-function assembleFeedRound(scoredDocDiscussion, scoredAll, usedIds, limit) {
+function assembleFeedRound(scoredProtected, scoredAll, usedIds, limit) {
   const chosen = [];
-  const docFloorCount = Math.max(1, Math.round(limit * DOC_DISCUSSION_FLOOR_RATIO));
+  const protectedFloorCount = Math.max(1, Math.round(limit * PROTECTED_FLOOR_RATIO));
   const diversityFloorCount = Math.max(1, Math.round(limit * DIVERSITY_FLOOR_RATIO));
 
-  for (const c of scoredDocDiscussion) {
-    if (chosen.length >= docFloorCount) break;
+  for (const c of scoredProtected) {
+    if (chosen.length >= protectedFloorCount) break;
     if (usedIds.has(c.id)) continue;
     chosen.push(c);
     usedIds.add(c.id);
@@ -1201,12 +1210,12 @@ function assembleFeedRound(scoredDocDiscussion, scoredAll, usedIds, limit) {
 function buildRankedFeed(candidates, viewer, offset, limit) {
   const scored = candidates.map((v) => ({ ...v, _score: computeFeedScore(v, viewer) }));
   const scoredAll = [...scored].sort((a, b) => b._score - a._score);
-  const scoredDocDiscussion = scoredAll.filter((v) => DOC_DISCUSSION_CATEGORIES.includes(v.content_category));
+  const scoredProtected = scoredAll.filter((v) => PROTECTED_CATEGORIES.includes(v.content_category));
 
   const usedIds = new Set();
   const assembled = [];
   while (assembled.length < offset + limit && usedIds.size < candidates.length) {
-    const round = assembleFeedRound(scoredDocDiscussion, scoredAll, usedIds, limit);
+    const round = assembleFeedRound(scoredProtected, scoredAll, usedIds, limit);
     if (round.length === 0) break; // no more unused candidates
     assembled.push(...round);
   }

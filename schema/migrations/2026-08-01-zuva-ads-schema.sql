@@ -45,10 +45,11 @@
 --  valid values are meant to match videos.content_category's real
 --  vocabulary — the authoritative list is CONTENT_CATEGORIES in
 --  zuva-api.js (also mirrored in the CHECK constraints added by
---  2026-07-26-feed-ranking.sql and 2026-07-26-categories-and-ai-
---  disclosure.sql):
+--  2026-07-26-feed-ranking.sql, 2026-07-26-categories-and-ai-
+--  disclosure.sql, and 2026-08-13-add-content-categories.sql):
 --    entertainment, music, comedy, drama_series, documentary,
 --    discussion_debate, interview, lifestyle_culture, news, nature,
+--    sports, tech_innovation, science_education, health_wellness,
 --    other
 --  "hair_beauty"/"food_beverage"/etc. are a different vocabulary
 --  entirely — this migration's own business_category values on

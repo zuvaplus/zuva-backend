@@ -200,13 +200,17 @@ npm run dev            # node --watch server.js
   ages well), and a small additive country-match boost (`users.preferred_country`
   vs. the creator's `country_code`, never a filter). See `FEED_WEIGHTS` in
   zuva-api.js for exact coefficients
-- **Documentary & Discussion umbrella** — `documentary`, `discussion_debate`,
-  `interview`, `lifestyle_culture` from `content_category`. A code-level grouping
-  only (`DOC_DISCUSSION_CATEGORIES`), not a DB concept. Gets completion weighted
-  even more heavily and view count de-emphasized in `computeFeedScore`, plus a
+- **Protected categories** — `documentary`, `discussion_debate`, `interview`,
+  `lifestyle_culture`, `sports`, `tech_innovation`, `science_education`,
+  `health_wellness` from `content_category`. A code-level grouping only
+  (`PROTECTED_CATEGORIES`), not a DB concept — originally just the
+  "Documentary & Discussion" umbrella (`DOC_DISCUSSION_CATEGORIES`), generalized
+  under this broader name when the 4 new categories were added with an explicit
+  requirement that they get the same protection. Gets completion weighted even
+  more heavily and view count de-emphasized in `computeFeedScore`, plus a
   guaranteed ~1-in-8 floor per page in `buildRankedFeed`/`assembleFeedRound` (a
   further ~1-in-6 slice is reserved for general category diversity so no single
-  category — Documentary & Discussion or otherwise — can dominate a page)
+  category — protected or otherwise — can dominate a page)
 - Feed assembly happens in application memory over a capped candidate pool
   (`FEED_CANDIDATE_POOL_SIZE = 500`, most recent published non-Flare videos) —
   fine for this catalog size pre-launch; revisit (push scoring into SQL, or
@@ -226,8 +230,11 @@ npm run dev            # node --watch server.js
   (`VALID_VIDEO_CATEGORIES` — Comedy/Drama/Music/News/Sports/Lifestyle/Education/
   Other), which stays as-is and is still used for admin/related-videos. Two
   category-like fields now coexist on `videos` — reconcile eventually, not done
-  as part of this task. `content_category` now has 11 values (added `nature`;
-  `news` already existed) — see `CONTENT_CATEGORIES` in zuva-api.js
+  as part of this task. `content_category` now has 15 values (added `nature`;
+  then `sports`, `tech_innovation`, `science_education`, `health_wellness` — note
+  `sports` here is a distinct value from the older `category` column's
+  pre-existing "Sports", a different taxonomy entirely; `news` already existed) —
+  see `CONTENT_CATEGORIES` in zuva-api.js
 - `GET /api/feed` also takes optional `content_category` and `country` (2-letter
   `users.country_code`) query params — both filter the SQL candidate pool before
   scoring, orthogonal to which ranking path a viewer gets. Reached from the

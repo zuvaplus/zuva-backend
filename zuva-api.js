@@ -1593,6 +1593,68 @@ router.get('/me/followed-creators',
   }
 );
 
+// ── GET /api/me ─────────────────────────────────────────────
+// The signed-in user's own full account record — backs /settings.
+// req.user (from requireAuth) only carries {id, role, email, username,
+// countryCode, walletId}, not the rest of these columns, so this does
+// its own lookup rather than reusing req.user directly.
+router.get('/me',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        SELECT id, username, email, role, display_name, avatar_url, bio,
+               country_code, preferred_country, preferred_languages,
+               COALESCE(follower_count, 0) AS follower_count, created_at
+        FROM users
+        WHERE id = $1
+      `, [req.user.id]);
+
+      if (!rows.length) return res.status(404).json({ error: 'User not found' });
+      res.json({ success: true, user: rows[0] });
+    } catch (err) {
+      console.error('me fetch error:', err.message);
+      res.status(500).json({ error: 'Could not load account' });
+    }
+  }
+);
+
+// ── PATCH /api/me/preferences ───────────────────────────────
+// preferred_country/preferred_languages exist on users (see
+// computeFeedScore's country-match boost + its "language has no
+// per-video signal yet" note) but until now nothing ever wrote them —
+// only ever read for ranking. This is their first real write path.
+router.patch('/me/preferences',
+  requireAuth,
+  [
+    body('preferred_country').optional({ nullable: true }).trim()
+      .isLength({ min: 2, max: 2 }).withMessage('preferred_country must be a 2-letter code'),
+    body('preferred_languages').optional({ nullable: true }).isArray()
+      .withMessage('preferred_languages must be an array of language codes'),
+    body('preferred_languages.*').optional().isString().trim().isLength({ min: 2, max: 8 }),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const { preferred_country, preferred_languages } = req.body;
+      const { rows } = await db.query(`
+        UPDATE users
+        SET preferred_country   = COALESCE($1, preferred_country),
+            preferred_languages = COALESCE($2, preferred_languages)
+        WHERE id = $3
+        RETURNING id, username, email, role, display_name, avatar_url, bio,
+                  country_code, preferred_country, preferred_languages,
+                  COALESCE(follower_count, 0) AS follower_count, created_at
+      `, [preferred_country ?? null, preferred_languages ?? null, req.user.id]);
+
+      res.json({ success: true, user: rows[0] });
+    } catch (err) {
+      console.error('preferences update error:', err.message);
+      res.status(500).json({ error: 'Could not update preferences' });
+    }
+  }
+);
+
 // ============================================================
 //  POST /api/feed/watch-progress
 //  Records one granular watch_events row — the missing signal

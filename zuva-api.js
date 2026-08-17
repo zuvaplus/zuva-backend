@@ -1555,6 +1555,31 @@ router.get('/me/saved',
   }
 );
 
+// ── GET /api/me/followed-creators ─────────────────────────────
+// Distinct creators the viewer subscribes to, most-recently-followed
+// first — backs the homepage's story-style avatar row (id/username/
+// avatar only, not their videos; that's GET /api/me/following above).
+router.get('/me/followed-creators',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        SELECT u.id, u.username, u.display_name, u.avatar_url
+        FROM subscriptions s
+        JOIN users u ON u.id = s.creator_id
+        WHERE s.subscriber_id = $1
+        ORDER BY s.created_at DESC
+        LIMIT $2
+      `, [req.user.id, MY_LIST_LIMIT]);
+
+      res.json({ success: true, creators: rows });
+    } catch (err) {
+      console.error('followed-creators error:', err.message);
+      res.status(500).json({ error: 'Could not load followed creators' });
+    }
+  }
+);
+
 // ============================================================
 //  POST /api/feed/watch-progress
 //  Records one granular watch_events row — the missing signal

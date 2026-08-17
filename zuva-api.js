@@ -1438,6 +1438,123 @@ router.get('/feed',
   }
 );
 
+// Shared videos+creator row -> FeedItem mapper for the three /api/me/*
+// lists below — same shape GET /api/feed already returns, so the
+// frontend can point FeedCard at any of these with no changes.
+function mapVideoFeedRow(r) {
+  return {
+    id: r.id, title: r.title, description: r.description,
+    cloudflare_video_id: r.cloudflare_video_id, thumbnail_url: r.thumbnail_url,
+    duration_seconds: r.duration_seconds, view_count: r.view_count,
+    like_count: r.like_count, comment_count: r.comment_count,
+    category: r.category, content_category: r.content_category,
+    tags: r.tags, created_at: r.created_at,
+    creator: {
+      id: r.creator_id, username: r.creator_username, display_name: r.creator_display_name,
+      avatar_url: r.creator_avatar_url, follower_count: r.creator_follower_count,
+    },
+  };
+}
+
+// Cap for all three /api/me/* lists below — no pagination UI on any of
+// them (single fetch, like GET /api/channel/:username), so this is
+// just a sane ceiling against unbounded growth, not a real page size.
+const MY_LIST_LIMIT = 100;
+
+// ── GET /api/me/following ─────────────────────────────────────
+// Latest videos from creators the viewer subscribes to.
+router.get('/me/following',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        SELECT v.id, v.title, v.description, v.cloudflare_video_id, v.thumbnail_url,
+               v.duration_seconds, v.view_count, v.like_count, v.comment_count,
+               v.category, v.content_category, v.tags, v.created_at,
+               u.id AS creator_id, u.username AS creator_username,
+               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+               COALESCE(u.follower_count, 0) AS creator_follower_count
+        FROM videos v
+        JOIN users u ON u.id = v.creator_id
+        JOIN subscriptions s ON s.creator_id = v.creator_id
+        WHERE s.subscriber_id = $1 AND v.status = 'published' AND v.is_flare = false
+        ORDER BY v.created_at DESC
+        LIMIT $2
+      `, [req.user.id, MY_LIST_LIMIT]);
+
+      res.json({ success: true, feed: rows.map(mapVideoFeedRow) });
+    } catch (err) {
+      console.error('following feed error:', err.message);
+      res.status(500).json({ error: 'Could not load following feed' });
+    }
+  }
+);
+
+// ── GET /api/me/history ───────────────────────────────────────
+// Distinct watched videos, most-recently-watched first. A video
+// watched multiple times is deduped and ordered by its latest watch.
+router.get('/me/history',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        SELECT v.id, v.title, v.description, v.cloudflare_video_id, v.thumbnail_url,
+               v.duration_seconds, v.view_count, v.like_count, v.comment_count,
+               v.category, v.content_category, v.tags, v.created_at,
+               u.id AS creator_id, u.username AS creator_username,
+               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+               COALESCE(u.follower_count, 0) AS creator_follower_count
+        FROM (
+          SELECT video_id, MAX(created_at) AS last_watched_at
+          FROM watch_events
+          WHERE user_id = $1
+          GROUP BY video_id
+        ) we
+        JOIN videos v ON v.id = we.video_id
+        JOIN users u ON u.id = v.creator_id
+        WHERE v.status = 'published' AND v.is_flare = false
+        ORDER BY we.last_watched_at DESC
+        LIMIT $2
+      `, [req.user.id, MY_LIST_LIMIT]);
+
+      res.json({ success: true, feed: rows.map(mapVideoFeedRow) });
+    } catch (err) {
+      console.error('history feed error:', err.message);
+      res.status(500).json({ error: 'Could not load watch history' });
+    }
+  }
+);
+
+// ── GET /api/me/saved ──────────────────────────────────────────
+// Bookmarked videos, most-recently-saved first (saved_videos —
+// 2026-08-17-saved-videos.sql).
+router.get('/me/saved',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        SELECT v.id, v.title, v.description, v.cloudflare_video_id, v.thumbnail_url,
+               v.duration_seconds, v.view_count, v.like_count, v.comment_count,
+               v.category, v.content_category, v.tags, v.created_at,
+               u.id AS creator_id, u.username AS creator_username,
+               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+               COALESCE(u.follower_count, 0) AS creator_follower_count
+        FROM saved_videos sv
+        JOIN videos v ON v.id = sv.video_id
+        JOIN users u ON u.id = v.creator_id
+        WHERE sv.user_id = $1 AND v.status = 'published' AND v.is_flare = false
+        ORDER BY sv.created_at DESC
+        LIMIT $2
+      `, [req.user.id, MY_LIST_LIMIT]);
+
+      res.json({ success: true, feed: rows.map(mapVideoFeedRow) });
+    } catch (err) {
+      console.error('saved feed error:', err.message);
+      res.status(500).json({ error: 'Could not load saved videos' });
+    }
+  }
+);
+
 // ============================================================
 //  POST /api/feed/watch-progress
 //  Records one granular watch_events row — the missing signal
@@ -2665,13 +2782,14 @@ router.get('/video/:id',
         avatar_url: row.c_avatar_url, follower_count: row.c_follower_count,
       };
 
-      // Viewer engagement state — anonymous viewers get false/false.
-      let viewer = { has_liked: false, is_subscribed: false };
+      // Viewer engagement state — anonymous viewers get false/false/false.
+      let viewer = { has_liked: false, is_subscribed: false, has_saved: false };
       if (req.user) {
         const { rows: v } = await db.query(`
           SELECT
             EXISTS (SELECT 1 FROM video_likes   WHERE video_id = $1 AND user_id = $2)       AS has_liked,
-            EXISTS (SELECT 1 FROM subscriptions WHERE creator_id = $3 AND subscriber_id = $2) AS is_subscribed
+            EXISTS (SELECT 1 FROM subscriptions WHERE creator_id = $3 AND subscriber_id = $2) AS is_subscribed,
+            EXISTS (SELECT 1 FROM saved_videos  WHERE video_id = $1 AND user_id = $2)       AS has_saved
         `, [video.id, req.user.id, video.creator_id]);
         viewer = v[0];
       }
@@ -2751,6 +2869,52 @@ router.delete('/video/:id/like',
     } catch (err) {
       console.error('unlike error:', err.message);
       res.status(500).json({ error: 'Could not unlike video' });
+    }
+  }
+);
+
+// ── POST /api/video/:id/save ──────────────────────────────────
+// Bookmarking — same idempotent shape as like/unlike above, against
+// saved_videos (2026-08-17-saved-videos.sql). No counter column: no UI
+// anywhere shows a "save count", unlike like_count.
+router.post('/video/:id/save',
+  requireAuth,
+  [param('id').isUUID().withMessage('Invalid video ID')],
+  validate,
+  async (req, res) => {
+    try {
+      const video = await getPublishedVideo(req.params.id);
+      if (!video) return res.status(404).json({ error: 'Video not found' });
+
+      await db.query(`
+        INSERT INTO saved_videos (video_id, user_id)
+        VALUES ($1, $2)
+        ON CONFLICT (video_id, user_id) DO NOTHING
+      `, [video.id, req.user.id]);
+
+      res.json({ success: true, saved: true });
+    } catch (err) {
+      console.error('save error:', err.message);
+      res.status(500).json({ error: 'Could not save video' });
+    }
+  }
+);
+
+// ── DELETE /api/video/:id/save ────────────────────────────────
+router.delete('/video/:id/save',
+  requireAuth,
+  [param('id').isUUID().withMessage('Invalid video ID')],
+  validate,
+  async (req, res) => {
+    try {
+      await db.query(
+        'DELETE FROM saved_videos WHERE video_id = $1 AND user_id = $2',
+        [req.params.id, req.user.id]
+      );
+      res.json({ success: true, saved: false });
+    } catch (err) {
+      console.error('unsave error:', err.message);
+      res.status(500).json({ error: 'Could not unsave video' });
     }
   }
 );

@@ -1059,6 +1059,12 @@ const CONTENT_CATEGORIES = [
   'sports', 'tech_innovation', 'science_education', 'health_wellness', 'other',
 ];
 
+// The older `category` column's taxonomy — moved up here (was declared
+// much further down, near the upload route) because GET /api/feed's
+// `category` query param filter needs it at module-load time, when the
+// route's express-validator array is built, not just at request time.
+const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'Lifestyle', 'Education', 'Other'];
+
 // Categories that get protected feed placement (the floor, below) and
 // different score weighting: completion rate matters even more, raw
 // view count matters less — so genuinely informative/enriching content
@@ -1295,6 +1301,9 @@ function buildFallbackFeed(candidates, offset, limit) {
 //
 //  Optional query params:
 //    content_category  filters to one CONTENT_CATEGORIES value
+//    category           filters to one VALID_VIDEO_CATEGORIES value —
+//                       the older taxonomy (Comedy/Drama/Music/...),
+//                       separate from content_category. Backs /category/:name.
 //    country           filters to one creator country_code (2-letter)
 //    sort              latest|oldest|most_viewed|most_liked — bypasses
 //                       the personalized/fallback ranking below entirely
@@ -1304,8 +1313,8 @@ function buildFallbackFeed(candidates, offset, limit) {
 //                       picks a sort option) preserves the existing
 //                       computeFeedScore/buildFallbackFeed behavior as
 //                       the default, unranked-by-recency experience.
-//  content_category/country apply to the candidate pool before scoring
-//  when unsorted — orthogonal to which ranking path is used.
+//  content_category/category/country apply to the candidate pool before
+//  scoring when unsorted — orthogonal to which ranking path is used.
 // ============================================================
 const FEED_SORT_ORDER_BY = {
   latest:      'v.created_at DESC, v.id DESC',
@@ -1320,6 +1329,7 @@ router.get('/feed',
     query('limit').optional().isInt({ min: 1, max: 50 }).toInt(),
     query('offset').optional().isInt({ min: 0 }).toInt(),
     query('content_category').optional().trim().isIn(CONTENT_CATEGORIES).withMessage('Invalid content_category'),
+    query('category').optional().trim().isIn(VALID_VIDEO_CATEGORIES).withMessage('Invalid category'),
     query('country').optional().trim().isLength({ min: 2, max: 2 }).withMessage('country must be a 2-letter code'),
     query('sort').optional().isIn(Object.keys(FEED_SORT_ORDER_BY)).withMessage('Invalid sort'),
   ],
@@ -1328,6 +1338,7 @@ router.get('/feed',
     const limit  = req.query.limit || 30;
     const offset = req.query.offset || 0;
     const contentCategoryFilter = req.query.content_category || null;
+    const categoryFilter = req.query.category || null;
     const countryFilter = req.query.country || null;
     const sort = req.query.sort || null;
 
@@ -1349,9 +1360,10 @@ router.get('/feed',
           WHERE v.status = 'published' AND v.is_flare = false
             AND ($3::text IS NULL OR v.content_category = $3)
             AND ($4::text IS NULL OR u.country_code = $4)
+            AND ($5::text IS NULL OR v.category = $5)
           ORDER BY ${FEED_SORT_ORDER_BY[sort]}
           LIMIT $1 OFFSET $2
-        `, [limit, offset, contentCategoryFilter, countryFilter]);
+        `, [limit, offset, contentCategoryFilter, countryFilter, categoryFilter]);
 
         const page = sorted.map((r) => ({
           id: r.id, title: r.title, description: r.description,
@@ -1408,9 +1420,10 @@ router.get('/feed',
         WHERE v.status = 'published' AND v.is_flare = false
           AND ($2::text IS NULL OR v.content_category = $2)
           AND ($3::text IS NULL OR u.country_code = $3)
+          AND ($4::text IS NULL OR v.category = $4)
         ORDER BY v.created_at DESC
         LIMIT $1
-      `, [FEED_CANDIDATE_POOL_SIZE, contentCategoryFilter, countryFilter]);
+      `, [FEED_CANDIDATE_POOL_SIZE, contentCategoryFilter, countryFilter, categoryFilter]);
 
       const useFallback = !req.user || !hasHistory;
       const assembled = useFallback
@@ -1953,10 +1966,11 @@ router.get('/creator-signup/confirm/:token',
 //  flagging). See GET /admin/moderation-queue and GET /api/admin/reports.
 // ============================================================
 
-const VALID_VIDEO_CATEGORIES = ['Comedy', 'Drama', 'Music', 'News', 'Sports', 'Lifestyle', 'Education', 'Other'];
-
-// See CONTENT_CATEGORIES near the feed-ranking code above (search
-// "MAIN FEED RANKING") for the richer taxonomy videos.content_category
+// VALID_VIDEO_CATEGORIES now declared near CONTENT_CATEGORIES, above —
+// see the note there for why (GET /api/feed's category filter needs it
+// at module-load time). See CONTENT_CATEGORIES near the feed-ranking
+// code above (search "MAIN FEED RANKING") for the richer taxonomy
+// videos.content_category
 // uses — required on upload, distinct from the category field above.
 
 // Flares (short-form vertical feed) share this same videos table/upload

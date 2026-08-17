@@ -1296,9 +1296,24 @@ function buildFallbackFeed(candidates, offset, limit) {
 //  Optional query params:
 //    content_category  filters to one CONTENT_CATEGORIES value
 //    country           filters to one creator country_code (2-letter)
-//  Both apply to the candidate pool before scoring — orthogonal to
-//  which ranking path (personalized vs. fallback) ends up being used.
+//    sort              latest|oldest|most_viewed|most_liked — bypasses
+//                       the personalized/fallback ranking below entirely
+//                       in favor of a plain ORDER BY + LIMIT/OFFSET query.
+//                       Omitted (the normal case — see VideoGrid.tsx,
+//                       which only sends this once a viewer explicitly
+//                       picks a sort option) preserves the existing
+//                       computeFeedScore/buildFallbackFeed behavior as
+//                       the default, unranked-by-recency experience.
+//  content_category/country apply to the candidate pool before scoring
+//  when unsorted — orthogonal to which ranking path is used.
 // ============================================================
+const FEED_SORT_ORDER_BY = {
+  latest:      'v.created_at DESC, v.id DESC',
+  oldest:      'v.created_at ASC, v.id ASC',
+  most_viewed: 'v.view_count DESC, v.created_at DESC, v.id DESC',
+  most_liked:  'v.like_count DESC, v.created_at DESC, v.id DESC',
+};
+
 router.get('/feed',
   optionalAuth,
   [
@@ -1306,6 +1321,7 @@ router.get('/feed',
     query('offset').optional().isInt({ min: 0 }).toInt(),
     query('content_category').optional().trim().isIn(CONTENT_CATEGORIES).withMessage('Invalid content_category'),
     query('country').optional().trim().isLength({ min: 2, max: 2 }).withMessage('country must be a 2-letter code'),
+    query('sort').optional().isIn(Object.keys(FEED_SORT_ORDER_BY)).withMessage('Invalid sort'),
   ],
   validate,
   async (req, res) => {
@@ -1313,8 +1329,46 @@ router.get('/feed',
     const offset = req.query.offset || 0;
     const contentCategoryFilter = req.query.content_category || null;
     const countryFilter = req.query.country || null;
+    const sort = req.query.sort || null;
 
     try {
+      // Explicit sort — a plain, unranked query. No candidate-pool cap,
+      // no personalization: just ORDER BY + real LIMIT/OFFSET pagination
+      // over the whole catalog, matching what "Most Viewed" etc. should
+      // actually mean.
+      if (sort) {
+        const { rows: sorted } = await db.query(`
+          SELECT v.id, v.title, v.description, v.cloudflare_video_id, v.thumbnail_url,
+                 v.duration_seconds, v.view_count, v.like_count, v.comment_count,
+                 v.category, v.content_category, v.tags, v.created_at,
+                 u.id AS creator_id, u.username AS creator_username,
+                 u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+                 COALESCE(u.follower_count, 0) AS creator_follower_count
+          FROM videos v
+          JOIN users u ON u.id = v.creator_id
+          WHERE v.status = 'published' AND v.is_flare = false
+            AND ($3::text IS NULL OR v.content_category = $3)
+            AND ($4::text IS NULL OR u.country_code = $4)
+          ORDER BY ${FEED_SORT_ORDER_BY[sort]}
+          LIMIT $1 OFFSET $2
+        `, [limit, offset, contentCategoryFilter, countryFilter]);
+
+        const page = sorted.map((r) => ({
+          id: r.id, title: r.title, description: r.description,
+          cloudflare_video_id: r.cloudflare_video_id, thumbnail_url: r.thumbnail_url,
+          duration_seconds: r.duration_seconds, view_count: r.view_count,
+          like_count: r.like_count, comment_count: r.comment_count,
+          category: r.category, content_category: r.content_category,
+          tags: r.tags, created_at: r.created_at,
+          creator: {
+            id: r.creator_id, username: r.creator_username, display_name: r.creator_display_name,
+            avatar_url: r.creator_avatar_url, follower_count: r.creator_follower_count,
+          },
+        }));
+
+        return res.json({ success: true, feed: page });
+      }
+
       let viewer = null;
       let hasHistory = false;
       if (req.user) {
@@ -2258,7 +2312,7 @@ router.get('/channel/:username',
       const creator = creatorRows[0];
 
       const { rows: videos } = await db.query(`
-        SELECT id, title, thumbnail_url, duration_seconds, view_count, category, created_at
+        SELECT id, title, thumbnail_url, duration_seconds, view_count, like_count, category, created_at
         FROM videos
         WHERE creator_id = $1 AND status = 'published'
         ORDER BY created_at DESC

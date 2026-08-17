@@ -2834,10 +2834,12 @@ router.get('/video/:id',
       }
 
       const { rows: related } = await db.query(`
-        SELECT id, title, thumbnail_url, duration_seconds, view_count, created_at
-        FROM videos
-        WHERE category = $1 AND status = 'published' AND id != $2
-        ORDER BY created_at DESC
+        SELECT v.id, v.title, v.thumbnail_url, v.duration_seconds, v.view_count, v.created_at,
+               u.username AS creator_username, u.display_name AS creator_display_name
+        FROM videos v
+        JOIN users u ON u.id = v.creator_id
+        WHERE v.category = $1 AND v.status = 'published' AND v.id != $2
+        ORDER BY v.created_at DESC
         LIMIT 6
       `, [video.category, video.id]);
 

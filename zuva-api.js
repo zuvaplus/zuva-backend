@@ -2804,6 +2804,45 @@ router.get('/flares/feed',
   }
 );
 
+// ── GET /api/flares/story-row ───────────────────────────────────
+// Backs the Instagram-Stories-style row atop /flares: followed creators
+// who've posted a Flare within the last 7 days, most-recent-Flare-first.
+// Distinct from GET /api/me/followed-creators (that's all followed
+// creators in follow order, with no awareness of Flares at all) — this
+// reuses the same subscriptions join that endpoint uses, plus the same
+// videos.is_flare filter GET /api/flares/feed uses, just combined and
+// narrowed to "posted in the last 7 days." Flares themselves are still
+// permanent (no TTL) — the 7-day window only limits which creators
+// surface here, same as Instagram's own "recent stories" row.
+router.get('/flares/story-row',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        SELECT id, username, display_name, avatar_url, latest_flare_id, latest_flare_at
+        FROM (
+          SELECT DISTINCT ON (u.id)
+                 u.id, u.username, u.display_name, u.avatar_url,
+                 v.id AS latest_flare_id, v.created_at AS latest_flare_at
+          FROM subscriptions s
+          JOIN users u ON u.id = s.creator_id
+          JOIN videos v ON v.creator_id = u.id
+          WHERE s.subscriber_id = $1
+            AND v.status = 'published' AND v.is_flare = true
+            AND v.created_at >= NOW() - INTERVAL '7 days'
+          ORDER BY u.id, v.created_at DESC
+        ) latest
+        ORDER BY latest_flare_at DESC
+      `, [req.user.id]);
+
+      res.json({ success: true, creators: rows });
+    } catch (err) {
+      console.error('flares story-row error:', err.message);
+      res.status(500).json({ error: 'Could not load Flares story row' });
+    }
+  }
+);
+
 // ── POST /api/flares/swipe-event ────────────────────────────────
 // Records one flare_swipe_events row — fired by the client on
 // swipe-away (leaving before 75% watched), loop detection (the player
